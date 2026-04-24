@@ -1,7 +1,7 @@
 import json
 import re
 from openai import AzureOpenAI
-from app.config import AI_ENDPOINT, AI_API_KEY, AI_MODEL
+from config import AI_ENDPOINT, AI_API_KEY, AI_MODEL
 
 
 client = None
