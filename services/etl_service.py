@@ -436,7 +436,7 @@ import pandas as pd
 import re
 from io import BytesIO
 from azure.storage.blob import BlobServiceClient
-from app.config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER
+from config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER
 
 
 class ETLService:
