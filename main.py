@@ -6,10 +6,10 @@ import uuid
 
 from azure.storage.blob import BlobServiceClient
 
-from app.services.pipeline_service import PipelineService
-from app.services.pipeline_manager import PipelineManager
-from app.services.scheduler_service import SchedulerService
-from app.config import BLOB_CONN_STR
+from services.pipeline_service import PipelineService
+from services.pipeline_manager import PipelineManager
+from services.scheduler_service import SchedulerService
+from config import BLOB_CONN_STR
 
 
 app = FastAPI(title="Auto Pipeline System")
