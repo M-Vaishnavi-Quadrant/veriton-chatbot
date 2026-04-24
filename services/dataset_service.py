@@ -264,7 +264,7 @@
 import json
 from azure.storage.blob import BlobServiceClient
 
-from app.config import BLOB_CONN_STR, DATASET_CONTAINER
+from config import BLOB_CONN_STR, DATASET_CONTAINER
 
 
 class DatasetService:
