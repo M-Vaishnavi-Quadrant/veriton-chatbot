@@ -245,7 +245,7 @@
 import io
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
-from app.config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER
+from config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER
 
 
 class DataModelService:
