@@ -123,7 +123,7 @@
 import boto3
 import os
 from azure.storage.blob import BlobServiceClient
-from app.config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER, AZURE_CONTAINER
+from config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER, AZURE_CONTAINER
 
 
 class IngestionService:
