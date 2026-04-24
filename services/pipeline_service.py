@@ -277,14 +277,14 @@ import uuid
 import json
 from azure.storage.blob import BlobServiceClient
 
-from app.agent.prompt_parser import parse_prompt
-from app.services.ingestion_service import IngestionService
-from app.services.datamodel_service import DataModelService
-from app.services.dataset_service import DatasetService
-from app.services.etl_service import ETLService
+from agent.prompt_parser import parse_prompt
+from services.ingestion_service import IngestionService
+from services.datamodel_service import DataModelService
+from services.dataset_service import DatasetService
+from services.etl_service import ETLService
 
 
-from app.config import BLOB_CONN_STR
+from config import BLOB_CONN_STR
 
 
 class PipelineService:
