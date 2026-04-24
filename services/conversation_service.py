@@ -1,5 +1,5 @@
 import uuid
-from app.services.session_store import session_store
+from services.session_store import session_store
 
 
 class ConversationService:
