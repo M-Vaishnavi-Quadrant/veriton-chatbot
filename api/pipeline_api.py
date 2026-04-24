@@ -1,10 +1,10 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.services.pipeline_service import PipelineService
-from app.services.conversation_service import ConversationService
-from app.services.pipeline_manager import PipelineManager
-from app.services.scheduler_service import SchedulerService
+from services.pipeline_service import PipelineService
+from services.conversation_service import ConversationService
+from services.pipeline_manager import PipelineManager
+from services.scheduler_service import SchedulerService
 
 # =========================
 # INIT SERVICES
