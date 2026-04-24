@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+azure-storage-blob
+azure-functions
+pandas
+pyarrow
+numpy
+openai
+azure-identity
+boto3
+apscheduler
