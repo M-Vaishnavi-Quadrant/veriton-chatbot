@@ -598,29 +598,35 @@ class ETLService:
             joined.add(right)
 
         # =====================
-        # DIM → DIM
+        # CONTROLLED DIM JOIN (FIXED)
         # =====================
-        for rel in relationships:
+        queue = list(joined)   # start with fact-connected tables
 
-            if rel["from_table"] not in joined and rel["from_table"] != fact:
-                continue
+        while queue:
+            current = queue.pop(0)
 
-            right = rel["to_table"]
+            for rel in relationships:
 
-            if right in joined:
-                continue
+                if rel["from_table"] != current:
+                    continue
 
-            if right not in tables:
-                continue
+                right = rel["to_table"]
 
-            lkey = self.find_column(df, rel["from_column"])
-            rkey = self.find_column(tables[right], rel["to_column"])
+                if right in joined:
+                    continue
 
-            self.log(f"Joining {rel['from_table']} → {right} on {lkey}={rkey}")
+                if right not in tables:
+                    continue
 
-            df = self.safe_merge(df, tables[right], lkey, rkey, right)
+                lkey = self.find_column(df, rel["from_column"])
+                rkey = self.find_column(tables[right], rel["to_column"])
 
-            joined.add(right)
+                self.log(f"Joining {current} → {right} on {lkey}={rkey}")
+
+                df = self.safe_merge(df, tables[right], lkey, rkey, right)
+
+                joined.add(right)
+                queue.append(right)
 
         # =====================
         # FINAL OUTPUT (🔥 FIXED - NO LOCAL FILE)
