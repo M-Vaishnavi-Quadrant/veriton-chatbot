@@ -246,6 +246,7 @@ def get_job_details(user_id: str, job_id: str):
 
         return {
             "job_id": job_id,
+            "pipeline_metadata": result.get("pipeline_metadata", {}),
 
             # ✅ NEW
             "pipeline_name": result["pipeline_metadata"].get("pipeline_name"),
