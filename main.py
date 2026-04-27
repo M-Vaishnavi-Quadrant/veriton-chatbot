@@ -12,11 +12,19 @@ from services.pipeline_manager import PipelineManager
 from services.scheduler_service import SchedulerService
 from config import BLOB_CONN_STR
 
-def extract_pipeline_name(user_input: str):
-    match = re.search(r"run (?:this )?pipeline (.+)", user_input.lower())
+def extract_pipeline_name(prompt: str):
+    match = re.search(r"run (?:this )?pipeline (.+)", prompt.lower())
     if match:
         return match.group(1).strip()
     return None
+
+def detect_intent(prompt: str):
+    text = prompt.lower()
+
+    if "run" in text and "pipeline" in text:
+        return "RUN_SAVED"
+
+    return "BUILD_NEW"
 
 
 app = FastAPI(title="Auto Pipeline System")
@@ -47,95 +55,231 @@ class RunSavedRequest(BaseModel):
     user_id: str
     user_input: str
 
+class PipelineRequest(BaseModel):
+    user_id: str
+    user_input: str
+    job_id: str  # ✅ supports both
+
 # =========================
 # RUN + AUTO SAVE PIPELINE
 # =========================
 @app.post("/run-pipeline")
 def run_pipeline(req: PromptRequest):
-    try:
-        # ensure job_id
-        job_id = req.job_id or str(uuid.uuid4())
+        try:
+            intent = detect_intent(req.prompt)
 
-        # run pipeline
-        result = pipeline_service.run(
-            prompt=req.prompt,
-            user_id=req.user_id,
-            job_id=job_id
-        )
+            # ensure job_id
+            job_id = req.job_id or str(uuid.uuid4())
 
-        # generate pipeline name
-        pipeline_name = f"pipeline_{str(uuid.uuid4())[:8]}"
+            # =========================
+            # RUN SAVED PIPELINE
+            # =========================
+            if intent == "RUN_SAVED":
 
-        metadata = result.get("pipeline_metadata")
+                pipeline_name = extract_pipeline_name(req.prompt)
 
-        # save pipeline
-        pipeline_manager.create_pipeline(
-            pipeline_name=pipeline_name,
-            prompt=metadata["prompt"],
-            user_id=metadata["user_id"],
-            schedule=None
-        )
+                if not pipeline_name:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="❌ Could not extract pipeline name"
+                    )
 
-        # ✅ FIX 1: store pipeline_name in result
-        result["pipeline_metadata"]["pipeline_name"] = pipeline_name
+                # load pipeline
+                pipeline = pipeline_manager.load_pipeline(
+                    pipeline_name=pipeline_name,
+                    user_id=req.user_id
+                )
 
-        # ✅ FIX 2: save result.json
-        import json
-        blob_client = pipeline_service.blob_service.get_blob_client(
-            container="jobs",
-            blob=f"{req.user_id}/{job_id}/result.json"
-        )
+                prompt = pipeline.get("prompt")
 
-        blob_client.upload_blob(
-            json.dumps(result, indent=2),
-            overwrite=True
-        )
+                if not prompt:
+                    raise HTTPException(status_code=400, detail="Pipeline has no prompt")
 
-        # extract full model output
-        model_data = result.get("data_model", {})
-        relationships = result.get("relationships", [])
-        schemas = result.get("schemas", {})
+                # run pipeline again
+                result = pipeline_service.run(
+                    prompt=prompt,
+                    user_id=req.user_id,
+                    job_id=job_id
+                )
 
-        return {
-            "status": "success",
-            "pipeline_name": pipeline_name,
-            "job_id": job_id,
-            "message": f"✅ Pipeline saved successfully as '{pipeline_name}'",
+            # =========================
+            # BUILD NEW PIPELINE
+            # =========================
+            else:
 
-            "data_model": model_data,
-            "relationships": relationships,
-            "schemas": schemas,
-            "final_dataset": result.get("final_dataset"),
+                result = pipeline_service.run(
+                    prompt=req.prompt,
+                    user_id=req.user_id,
+                    job_id=job_id
+                )
 
-            # download endpoint
-            "download_url": f"/download/{req.user_id}/{job_id}"
-        }
+                # generate pipeline name
+                pipeline_name = f"pipeline_{str(uuid.uuid4())[:8]}"
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+                # save pipeline
+                pipeline_manager.create_pipeline(
+                    pipeline_name=pipeline_name,
+                    prompt=req.prompt,
+                    user_id=req.user_id,
+                    schedule=None
+                )
 
+            # =========================
+            # COMMON LOGIC (🔥 important)
+            # =========================
 
-# =========================
-# RUN SAVED PIPELINE
-# =========================
-@app.post("/run-saved-pipeline")
-def run_saved(req: RunSavedRequest):
-    try:
-        pipeline_name = extract_pipeline_name(req.user_input)
+            # inject pipeline_name
+            result["pipeline_metadata"]["pipeline_name"] = pipeline_name
 
-        if not pipeline_name:
-            raise HTTPException(
-                status_code=400,
-                detail="❌ Could not extract pipeline name from input"
+            # save job result
+            import json
+            blob_client = pipeline_service.blob_service.get_blob_client(
+                container="jobs",
+                blob=f"{req.user_id}/{job_id}/result.json"
             )
 
-        return pipeline_manager.run_saved_pipeline(
-            pipeline_name=pipeline_name,
-            user_id=req.user_id
-        )
+            blob_client.upload_blob(
+                json.dumps(result, indent=2),
+                overwrite=True
+            )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            return {
+                "status": "success",
+                "mode": intent.lower(),
+                "pipeline_name": pipeline_name,
+                "job_id": job_id,
+
+                "data_model": result.get("data_model"),
+                "relationships": result.get("relationships"),
+                "schemas": result.get("schemas"),
+                "final_dataset": result.get("final_dataset"),
+
+                "download_url": f"/download/{req.user_id}/{job_id}"
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+    
+# @app.post("/pipeline")
+# def handle_pipeline(req: PipelineRequest):
+#     try:
+#         intent = detect_intent(req.user_input)
+
+#         # ensure job_id
+#         job_id = req.job_id or str(uuid.uuid4())
+
+#         # =========================
+#         # RUN SAVED PIPELINE
+#         # =========================
+#         if intent == "RUN_SAVED":
+
+#             pipeline_name = extract_pipeline_name(req.user_input)
+
+#             if not pipeline_name:
+#                 raise HTTPException(
+#                     status_code=400,
+#                     detail="❌ Could not extract pipeline name"
+#                 )
+
+#             # load pipeline
+#             pipeline = pipeline_manager.load_pipeline(
+#                 pipeline_name=pipeline_name,
+#                 user_id=req.user_id
+#             )
+
+#             prompt = pipeline.get("prompt")
+
+#             if not prompt:
+#                 raise HTTPException(status_code=400, detail="Pipeline has no prompt")
+
+#             # run pipeline again
+#             result = pipeline_service.run(
+#                 prompt=prompt,
+#                 user_id=req.user_id,
+#                 job_id=job_id
+#             )
+
+#         # =========================
+#         # BUILD NEW PIPELINE
+#         # =========================
+#         else:
+
+#             result = pipeline_service.run(
+#                 prompt=req.user_input,
+#                 user_id=req.user_id,
+#                 job_id=job_id
+#             )
+
+#             # generate pipeline name
+#             pipeline_name = f"pipeline_{str(uuid.uuid4())[:8]}"
+
+#             # save pipeline
+#             pipeline_manager.create_pipeline(
+#                 pipeline_name=pipeline_name,
+#                 prompt=req.user_input,
+#                 user_id=req.user_id,
+#                 schedule=None
+#             )
+
+#         # =========================
+#         # COMMON LOGIC (🔥 important)
+#         # =========================
+
+#         # inject pipeline_name
+#         result["pipeline_metadata"]["pipeline_name"] = pipeline_name
+
+#         # save job result
+#         import json
+#         blob_client = pipeline_service.blob_service.get_blob_client(
+#             container="jobs",
+#             blob=f"{req.user_id}/{job_id}/result.json"
+#         )
+
+#         blob_client.upload_blob(
+#             json.dumps(result, indent=2),
+#             overwrite=True
+#         )
+
+#         return {
+#             "status": "success",
+#             "mode": intent.lower(),
+#             "pipeline_name": pipeline_name,
+#             "job_id": job_id,
+
+#             "data_model": result.get("data_model"),
+#             "relationships": result.get("relationships"),
+#             "schemas": result.get("schemas"),
+#             "final_dataset": result.get("final_dataset"),
+
+#             "download_url": f"/download/{req.user_id}/{job_id}"
+#         }
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+
+# # =========================
+# # RUN SAVED PIPELINE
+# # =========================
+# @app.post("/run-saved-pipeline")
+# def run_saved(req: RunSavedRequest):
+#     try:
+#         pipeline_name = extract_pipeline_name(req.user_input)
+
+#         if not pipeline_name:
+#             raise HTTPException(
+#                 status_code=400,
+#                 detail="❌ Could not extract pipeline name from input"
+#             )
+
+#         return pipeline_manager.run_saved_pipeline(
+#             pipeline_name=pipeline_name,
+#             user_id=req.user_id
+#         )
+
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
 
 
 # =========================
@@ -246,6 +390,7 @@ def get_job_details(user_id: str, job_id: str):
 
         return {
             "job_id": job_id,
+
             "pipeline_metadata": result.get("pipeline_metadata", {}),
 
             # ✅ NEW
