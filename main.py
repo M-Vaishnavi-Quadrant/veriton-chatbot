@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import uuid
+import re
 
 from azure.storage.blob import BlobServiceClient
 
@@ -10,6 +11,12 @@ from services.pipeline_service import PipelineService
 from services.pipeline_manager import PipelineManager
 from services.scheduler_service import SchedulerService
 from config import BLOB_CONN_STR
+
+def extract_pipeline_name(user_input: str):
+    match = re.search(r"run (?:this )?pipeline (.+)", user_input.lower())
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 app = FastAPI(title="Auto Pipeline System")
@@ -37,9 +44,8 @@ class PromptRequest(BaseModel):
 
 
 class RunSavedRequest(BaseModel):
-    pipeline_name: str
     user_id: str
-
+    user_input: str
 
 # =========================
 # RUN + AUTO SAVE PIPELINE
@@ -70,6 +76,21 @@ def run_pipeline(req: PromptRequest):
             schedule=None
         )
 
+        # ✅ FIX 1: store pipeline_name in result
+        result["pipeline_metadata"]["pipeline_name"] = pipeline_name
+
+        # ✅ FIX 2: save result.json
+        import json
+        blob_client = pipeline_service.blob_service.get_blob_client(
+            container="jobs",
+            blob=f"{req.user_id}/{job_id}/result.json"
+        )
+
+        blob_client.upload_blob(
+            json.dumps(result, indent=2),
+            overwrite=True
+        )
+
         # extract full model output
         model_data = result.get("data_model", {})
         relationships = result.get("relationships", [])
@@ -81,7 +102,6 @@ def run_pipeline(req: PromptRequest):
             "job_id": job_id,
             "message": f"✅ Pipeline saved successfully as '{pipeline_name}'",
 
-            # full response
             "data_model": model_data,
             "relationships": relationships,
             "schemas": schemas,
@@ -101,10 +121,19 @@ def run_pipeline(req: PromptRequest):
 @app.post("/run-saved-pipeline")
 def run_saved(req: RunSavedRequest):
     try:
+        pipeline_name = extract_pipeline_name(req.user_input)
+
+        if not pipeline_name:
+            raise HTTPException(
+                status_code=400,
+                detail="❌ Could not extract pipeline name from input"
+            )
+
         return pipeline_manager.run_saved_pipeline(
-            pipeline_name=req.pipeline_name,
+            pipeline_name=pipeline_name,
             user_id=req.user_id
         )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -213,14 +242,26 @@ def get_job_details(user_id: str, job_id: str):
         import json
         data = blob_client.download_blob().readall()
 
-        return json.loads(data)
+        result = json.loads(data)
+
+        return {
+            "job_id": job_id,
+
+            # ✅ NEW
+            "pipeline_name": result["pipeline_metadata"].get("pipeline_name"),
+
+            "data_model": result.get("data_model"),
+            "relationships": result.get("relationships"),
+            "schemas": result.get("schemas"),
+            "final_dataset": result.get("final_dataset"),
+
+            # ✅ NEW
+            "download_url": f"/download/{user_id}/{job_id}"
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     
-# =========================
-# JOBS SUMMARY (FULL DATA)
-# =========================
 @app.get("/jobs-summary/{user_id}")
 def get_jobs_summary(user_id: str):
     try:
@@ -229,11 +270,10 @@ def get_jobs_summary(user_id: str):
         blobs = container.list_blobs(name_starts_with=f"{user_id}/")
 
         import json
-        jobs = []
+        results = []
 
         for blob in blobs:
             if blob.name.endswith("result.json"):
-
                 blob_client = pipeline_service.blob_service.get_blob_client(
                     container="jobs",
                     blob=blob.name
@@ -241,17 +281,21 @@ def get_jobs_summary(user_id: str):
 
                 data = json.loads(blob_client.download_blob().readall())
 
-                job_id = data.get("pipeline_metadata", {}).get("job_id")
+                results.append({
+                        "job_id": data["pipeline_metadata"]["job_id"],
 
-                jobs.append({
-                    "job_id": job_id,
-                    **data
-                })
+                        # ✅ NEW
+                        "pipeline_name": data["pipeline_metadata"].get("pipeline_name"),
 
-        return {
-            "user_id": user_id,
-            "jobs": jobs
-        }
+                        "fact_table": data["data_model"]["fact_table"],
+                        "rows": data["final_dataset"]["rows"],
+                        "columns": data["final_dataset"]["columns"],
+
+                        # ✅ NEW
+                        "download_url": f"/download/{user_id}/{data['pipeline_metadata']['job_id']}"
+                    })
+
+        return results
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
