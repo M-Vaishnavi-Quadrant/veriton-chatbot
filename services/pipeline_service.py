@@ -275,6 +275,7 @@
 
 import uuid
 import json
+from datetime import datetime
 from azure.storage.blob import BlobServiceClient
 
 from agent.prompt_parser import parse_prompt
@@ -283,8 +284,7 @@ from services.datamodel_service import DataModelService
 from services.dataset_service import DatasetService
 from services.etl_service import ETLService
 
-
-from config import BLOB_CONN_STR
+from config import BLOB_CONN_STR, V_CONNECTION_STRING, V_DATASET_CONTAINER
 
 
 class PipelineService:
@@ -295,12 +295,40 @@ class PipelineService:
         self.dataset = DatasetService()
         self.etl = ETLService()
 
-        # ✅ KEEP THIS (needed by pipeline_manager)
+        # Main storage (jobs, ingestion etc.)
         self.blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
 
-    # =====================================================
+        # Dataset storage (separate account)
+        self.dataset_blob_service = BlobServiceClient.from_connection_string(V_CONNECTION_STRING)
+
+    # =========================
+    # DATASET UPLOAD (NEW)
+    # =========================
+    def upload_dataset(self, file_buffer, user_id, job_id, dataset_context):
+
+        from datetime import datetime
+
+        base_name = dataset_context.lower().replace(" ", "_")
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+
+        dataset_name = f"{base_name}_dataset.csv"
+        blob_path = f"{user_id}/{job_id}/{dataset_name}"
+
+        blob = self.dataset_blob_service.get_blob_client(
+            container=V_DATASET_CONTAINER,
+            blob=blob_path
+        )
+
+        blob.upload_blob(file_buffer, overwrite=False)
+
+        return {
+            "dataset_name": dataset_name,
+            "dataset_path": blob_path
+        }
+
+    # =========================
     # RUN PIPELINE
-    # =====================================================
+    # =========================
     def run(self, prompt, user_id, job_id=None):
 
         if not job_id:
@@ -308,44 +336,34 @@ class PipelineService:
 
         print("\n🚀 PIPELINE STARTED")
 
-        # =========================
         # STEP 1: PARSE
-        # =========================
         plan = parse_prompt(prompt)
         sources = plan.get("sources", [])
 
         if not sources:
             raise Exception("No sources detected")
 
-        # =========================
         # STEP 2: INGESTION
-        # =========================
         self.ingestion.ingest_sources(
             sources=sources,
             user_id=user_id,
             job_id=job_id
         )
 
-        # =========================
         # STEP 3: DATA MODEL
-        # =========================
         model_output = self.datamodel.execute(
             user_id=user_id,
             job_id=job_id
         )
 
-        # =========================
         # STEP 4: DATASET
-        # =========================
         dataset_output = self.dataset.execute(
             model_output=model_output,
             user_id=user_id,
             job_id=job_id
         )
 
-        # =========================
-        # STEP 5: ETL (🔥 FIXED)
-        # =========================
+        # STEP 5: ETL
         etl_output = self.etl.execute(
             dataset=dataset_output["dataset"],
             user_id=user_id,
@@ -353,20 +371,27 @@ class PipelineService:
             model_output=model_output
         )
 
-        # ❌ REMOVED:
-        # upload_to_blob()
-        # etl_output["file"]
-
-        # =========================
-        # FINAL MODEL
-        # =========================
         model_data = model_output["model_output"]["data"]
 
-        # FACT TABLE
         fact_table = model_data.get("fact_override") or model_data["model"].get("fact_table")
 
+        file_buffer = etl_output.get("file_buffer")
+
+        if not file_buffer:
+            raise Exception(f"ETL output missing file_buffer: {etl_output}")
+
         # =========================
-        # DIMENSIONS (dynamic)
+        # SAVE DATASET (NEW)
+        # =========================
+        dataset_info = self.upload_dataset(
+            file_buffer=file_buffer,
+            user_id=user_id,
+            job_id=job_id,
+            dataset_context=fact_table
+        )
+
+        # =========================
+        # DIMENSIONS
         # =========================
         dimension_tables = set()
 
@@ -393,48 +418,15 @@ class PipelineService:
         ]
 
         # =========================
-        # FINAL DATASET
+        # FINAL DATASET RESPONSE
         # =========================
         final_dataset = {
             "rows": etl_output.get("rows"),
             "columns": etl_output.get("columns"),
-            "preview": etl_output.get("preview")
+            "preview": etl_output.get("preview"),
+            "dataset_name": dataset_info["dataset_name"],
+            "dataset_path": dataset_info["dataset_path"]
         }
-
-
-        # =========================
-        # SAVE RESULT TO BLOB
-        # =========================
-        container_name = "jobs"
-        blob_path = f"{user_id}/{job_id}/result.json"
-
-        result_payload = {
-            "status": "success",
-            "data_model": {
-                "fact_table": fact_table,
-                "dimension_tables": dimension_tables
-            },
-            "relationships": relationships,
-            "schemas": model_data.get("schemas", {}),
-            "final_dataset": final_dataset,
-            "pipeline_metadata": {
-                "prompt": prompt,
-                "user_id": user_id,
-                "job_id": job_id
-            }
-        }
-
-        blob_client = self.blob_service.get_blob_client(
-            container=container_name,
-            blob=blob_path
-        )
-
-        blob_client.upload_blob(
-            json.dumps(result_payload),
-            overwrite=True
-        )
-
-        print(f"✅ Saved result to: {blob_path}")
 
         return {
             "status": "success",
@@ -445,8 +437,6 @@ class PipelineService:
             "relationships": relationships,
             "schemas": model_data.get("schemas", {}),
             "final_dataset": final_dataset,
-
-            # used by main.py
             "pipeline_metadata": {
                 "prompt": prompt,
                 "user_id": user_id,
