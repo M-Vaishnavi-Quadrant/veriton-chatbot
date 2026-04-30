@@ -6,6 +6,8 @@ load_dotenv()   # 👈 THIS IS THE MISSING PIECE
 # Storage
 STORAGE_ACCOUNT_NAME = os.getenv("STORAGE_ACCOUNT_NAME")
 STORAGE_ACCOUNT_KEY = os.getenv("STORAGE_ACCOUNT_KEY")
+V_CONNECTION_STRING = os.getenv("V_CONNECTION_STRING")
+
 
 BLOB_CONN_STR = (
     f"DefaultEndpointsProtocol=https;"
@@ -26,3 +28,4 @@ DATASET_CONTAINER = "datasets"
 METADATA_CONTAINER = "metadata"
 RELATIONSHIP_CONTAINER = "relationships"
 NORMALIZED_CONTAINER = "normalized"
+V_DATASET_CONTAINER = "datasets"
