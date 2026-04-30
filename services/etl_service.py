@@ -633,8 +633,16 @@ class ETLService:
         # =====================
         self.log(f"Final rows: {len(df)}")
         self.log(f"Final columns: {len(df.columns)}")
+        self.log(f"Final rows: {len(df)}")
+        # self.log(f"Final columns: {len(df.columns)}")
+
+        # 🔥 Convert dataframe to CSV in memory
+        buffer = BytesIO()
+        df.to_csv(buffer, index=False)
+        buffer.seek(0)
 
         return {
+            "file_buffer": buffer,   # 🔥 NEW
             "rows": len(df),
             "columns": list(df.columns),
             "preview": df.head(10).to_dict(orient="records")
