@@ -3,448 +3,228 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import uuid
-import re
+import json
 
 from azure.storage.blob import BlobServiceClient
 
 from services.pipeline_service import PipelineService
-from services.pipeline_manager import PipelineManager
-from services.scheduler_service import SchedulerService
-from config import BLOB_CONN_STR
+from config import BLOB_CONN_STR, V_CONNECTION_STRING, V_DATASET_CONTAINER
 
-def extract_pipeline_name(prompt: str):
-    match = re.search(r"run (?:this )?pipeline (.+)", prompt.lower())
-    if match:
-        return match.group(1).strip()
-    return None
+app = FastAPI(title="Job Execution System")
 
-def detect_intent(prompt: str):
-    text = prompt.lower()
-
-    if "run" in text and "pipeline" in text:
-        return "RUN_SAVED"
-
-    return "BUILD_NEW"
-
-
-app = FastAPI(title="Auto Pipeline System")
-
-# =========================
-# INIT SERVICES
-# =========================
 pipeline_service = PipelineService()
-scheduler_service = SchedulerService()
-
-pipeline_manager = PipelineManager(
-    blob_service=pipeline_service.blob_service,
-    scheduler=scheduler_service,
-    pipeline_service=pipeline_service
-)
-
 
 # =========================
 # REQUEST MODELS
 # =========================
-class PromptRequest(BaseModel):
+class RunRequest(BaseModel):
     user_id: str
     prompt: str
     job_id: Optional[str] = None
 
 
-class RunSavedRequest(BaseModel):
+class SaveJobRequest(BaseModel):
     user_id: str
-    user_input: str
+    job_id: str
+    job_name: str
 
-class PipelineRequest(BaseModel):
+
+class RenameDatasetRequest(BaseModel):
     user_id: str
-    user_input: str
-    job_id: str  # ✅ supports both
-
-# =========================
-# RUN + AUTO SAVE PIPELINE
-# =========================
-@app.post("/run-pipeline")
-def run_pipeline(req: PromptRequest):
-        try:
-            intent = detect_intent(req.prompt)
-
-            # ensure job_id
-            job_id = req.job_id or str(uuid.uuid4())
-
-            # =========================
-            # RUN SAVED PIPELINE
-            # =========================
-            if intent == "RUN_SAVED":
-
-                pipeline_name = extract_pipeline_name(req.prompt)
-
-                if not pipeline_name:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="❌ Could not extract pipeline name"
-                    )
-
-                # load pipeline
-                pipeline = pipeline_manager.load_pipeline(
-                    pipeline_name=pipeline_name,
-                    user_id=req.user_id
-                )
-
-                prompt = pipeline.get("prompt")
-
-                if not prompt:
-                    raise HTTPException(status_code=400, detail="Pipeline has no prompt")
-
-                # run pipeline again
-                result = pipeline_service.run(
-                    prompt=prompt,
-                    user_id=req.user_id,
-                    job_id=job_id
-                )
-
-            # =========================
-            # BUILD NEW PIPELINE
-            # =========================
-            else:
-
-                result = pipeline_service.run(
-                    prompt=req.prompt,
-                    user_id=req.user_id,
-                    job_id=job_id
-                )
-
-                # generate pipeline name
-                pipeline_name = f"pipeline_{str(uuid.uuid4())[:8]}"
-
-                # save pipeline
-                pipeline_manager.create_pipeline(
-                    pipeline_name=pipeline_name,
-                    prompt=req.prompt,
-                    user_id=req.user_id,
-                    schedule=None
-                )
-
-            # =========================
-            # COMMON LOGIC (🔥 important)
-            # =========================
-
-            # inject pipeline_name
-            result["pipeline_metadata"]["pipeline_name"] = pipeline_name
-
-            # save job result
-            import json
-            blob_client = pipeline_service.blob_service.get_blob_client(
-                container="jobs",
-                blob=f"{req.user_id}/{job_id}/result.json"
-            )
-
-            blob_client.upload_blob(
-                json.dumps(result, indent=2),
-                overwrite=True
-            )
-
-            return {
-                "status": "success",
-                "mode": intent.lower(),
-                "pipeline_name": pipeline_name,
-                "job_id": job_id,
-
-                "data_model": result.get("data_model"),
-                "relationships": result.get("relationships"),
-                "schemas": result.get("schemas"),
-                "final_dataset": result.get("final_dataset"),
-
-                "download_url": f"/download/{req.user_id}/{job_id}"
-            }
-
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=str(e))
-
-    
-# @app.post("/pipeline")
-# def handle_pipeline(req: PipelineRequest):
-#     try:
-#         intent = detect_intent(req.user_input)
-
-#         # ensure job_id
-#         job_id = req.job_id or str(uuid.uuid4())
-
-#         # =========================
-#         # RUN SAVED PIPELINE
-#         # =========================
-#         if intent == "RUN_SAVED":
-
-#             pipeline_name = extract_pipeline_name(req.user_input)
-
-#             if not pipeline_name:
-#                 raise HTTPException(
-#                     status_code=400,
-#                     detail="❌ Could not extract pipeline name"
-#                 )
-
-#             # load pipeline
-#             pipeline = pipeline_manager.load_pipeline(
-#                 pipeline_name=pipeline_name,
-#                 user_id=req.user_id
-#             )
-
-#             prompt = pipeline.get("prompt")
-
-#             if not prompt:
-#                 raise HTTPException(status_code=400, detail="Pipeline has no prompt")
-
-#             # run pipeline again
-#             result = pipeline_service.run(
-#                 prompt=prompt,
-#                 user_id=req.user_id,
-#                 job_id=job_id
-#             )
-
-#         # =========================
-#         # BUILD NEW PIPELINE
-#         # =========================
-#         else:
-
-#             result = pipeline_service.run(
-#                 prompt=req.user_input,
-#                 user_id=req.user_id,
-#                 job_id=job_id
-#             )
-
-#             # generate pipeline name
-#             pipeline_name = f"pipeline_{str(uuid.uuid4())[:8]}"
-
-#             # save pipeline
-#             pipeline_manager.create_pipeline(
-#                 pipeline_name=pipeline_name,
-#                 prompt=req.user_input,
-#                 user_id=req.user_id,
-#                 schedule=None
-#             )
-
-#         # =========================
-#         # COMMON LOGIC (🔥 important)
-#         # =========================
-
-#         # inject pipeline_name
-#         result["pipeline_metadata"]["pipeline_name"] = pipeline_name
-
-#         # save job result
-#         import json
-#         blob_client = pipeline_service.blob_service.get_blob_client(
-#             container="jobs",
-#             blob=f"{req.user_id}/{job_id}/result.json"
-#         )
-
-#         blob_client.upload_blob(
-#             json.dumps(result, indent=2),
-#             overwrite=True
-#         )
-
-#         return {
-#             "status": "success",
-#             "mode": intent.lower(),
-#             "pipeline_name": pipeline_name,
-#             "job_id": job_id,
-
-#             "data_model": result.get("data_model"),
-#             "relationships": result.get("relationships"),
-#             "schemas": result.get("schemas"),
-#             "final_dataset": result.get("final_dataset"),
-
-#             "download_url": f"/download/{req.user_id}/{job_id}"
-#         }
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
-# # =========================
-# # RUN SAVED PIPELINE
-# # =========================
-# @app.post("/run-saved-pipeline")
-# def run_saved(req: RunSavedRequest):
-#     try:
-#         pipeline_name = extract_pipeline_name(req.user_input)
-
-#         if not pipeline_name:
-#             raise HTTPException(
-#                 status_code=400,
-#                 detail="❌ Could not extract pipeline name from input"
-#             )
-
-#         return pipeline_manager.run_saved_pipeline(
-#             pipeline_name=pipeline_name,
-#             user_id=req.user_id
-#         )
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
+    job_id: str
+    old_name: str
+    new_name: str
 
 
 # =========================
-# DOWNLOAD DATASET FROM BLOB
+# RUN (NO SAVE)
 # =========================
-@app.get("/download/{user_id}/{job_id}")
-def download_dataset(user_id: str, job_id: str):
+@app.post("/run")
+def run(req: RunRequest):
     try:
-        blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+        job_id = req.job_id or str(uuid.uuid4())
 
-        container = blob_service.get_container_client("finaldataset")
-
-        blob_path = f"{user_id}/{job_id}/final_dataset.csv"
-
-        blob_client = container.get_blob_client(blob_path)
-
-        if not blob_client.exists():
-            raise HTTPException(status_code=404, detail="Dataset not found")
-
-        stream = blob_client.download_blob()
-
-        return StreamingResponse(
-            stream.chunks(),
-            media_type="text/csv",
-            headers={
-                "Content-Disposition": f"attachment; filename=final_dataset_{job_id}.csv"
-            }
+        result = pipeline_service.run(
+            prompt=req.prompt,
+            user_id=req.user_id,
+            job_id=job_id
         )
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# =========================
-# LIST PIPELINES
-# =========================
-@app.get("/pipelines/{user_id}")
-def list_pipelines(user_id: str):
-    try:
-        container = pipeline_manager.blob.get_container_client("pipelines")
-
-        pipelines = [
-            blob.name.split("/")[-1].replace(".json", "")
-            for blob in container.list_blobs(name_starts_with=f"{user_id}/")
-        ]
-
-        return {"pipelines": pipelines}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# =========================
-# DELETE PIPELINE
-# =========================
-@app.delete("/pipelines/{user_id}/{pipeline_name}")
-def delete_pipeline(user_id: str, pipeline_name: str):
-    try:
-        container = pipeline_manager.blob.get_container_client("pipelines")
-
-        path = f"{user_id}/{pipeline_name}.json"
-
-        container.delete_blob(path)
-
-        return {"message": "Pipeline deleted"}
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/jobs/{user_id}")
-def get_jobs(user_id: str):
-    try:
-        container = pipeline_service.blob_service.get_container_client("jobs")
-
-        blobs = container.list_blobs(name_starts_with=f"{user_id}/")
-
-        jobs = set()
-
-        for blob in blobs:
-            parts = blob.name.split("/")
-            if len(parts) >= 2:
-                jobs.add(parts[1])  # job_id
-
         return {
-            "user_id": user_id,
-            "jobs": list(jobs)
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/jobs/{user_id}/{job_id}")
-def get_job_details(user_id: str, job_id: str):
-    try:
-        blob_client = pipeline_service.blob_service.get_blob_client(
-            container="jobs",
-            blob=f"{user_id}/{job_id}/result.json"
-        )
-
-        if not blob_client.exists():
-            raise HTTPException(status_code=404, detail="Job not found")
-
-        import json
-        data = blob_client.download_blob().readall()
-
-        result = json.loads(data)
-
-        return {
+            "status": "success",
             "job_id": job_id,
 
-            "pipeline_metadata": result.get("pipeline_metadata", {}),
-
-            # ✅ NEW
-            "pipeline_name": result["pipeline_metadata"].get("pipeline_name"),
+            # 👇 suggested name
+            "suggested_job_name": f"{result['data_model']['fact_table']}_job",
 
             "data_model": result.get("data_model"),
             "relationships": result.get("relationships"),
             "schemas": result.get("schemas"),
-            "final_dataset": result.get("final_dataset"),
 
-            # ✅ NEW
-            "download_url": f"/download/{user_id}/{job_id}"
+            # 🔥 IMPORTANT: includes dataset_name + dataset_path
+            "final_dataset": result.get("final_dataset")
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-    
-@app.get("/jobs-summary/{user_id}")
-def get_jobs_summary(user_id: str):
+
+
+# =========================
+# SAVE JOB (WITH DATASET)
+# =========================
+@app.post("/save-job")
+def save_job(req: SaveJobRequest):
     try:
-        container = pipeline_service.blob_service.get_container_client("jobs")
+        safe_name = req.job_name.strip().replace(" ", "_").lower()
 
-        blobs = container.list_blobs(name_starts_with=f"{user_id}/")
+        # =========================
+        # FIND DATASET AUTOMATICALLY
+        # =========================
+        dataset_container = pipeline_service.dataset_blob_service.get_container_client(V_DATASET_CONTAINER)
 
-        import json
-        results = []
+        blobs = dataset_container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
 
-        for blob in blobs:
-            if blob.name.endswith("result.json"):
-                blob_client = pipeline_service.blob_service.get_blob_client(
-                    container="jobs",
-                    blob=blob.name
-                )
+        dataset_blob = None
 
-                data = json.loads(blob_client.download_blob().readall())
+        for b in blobs:
+            if b.name.endswith(".csv"):
+                dataset_blob = b.name
+                break
 
-                results.append({
-                        "job_id": data["pipeline_metadata"]["job_id"],
+        if not dataset_blob:
+            raise HTTPException(status_code=404, detail="Dataset not found for this job")
 
-                        # ✅ NEW
-                        "pipeline_name": data["pipeline_metadata"].get("pipeline_name"),
+        dataset_name = dataset_blob.split("/")[-1]
 
-                        "fact_table": data["data_model"]["fact_table"],
-                        "rows": data["final_dataset"]["rows"],
-                        "columns": data["final_dataset"]["columns"],
+        # =========================
+        # SAVE JOB
+        # =========================
+        blob_path = f"{req.user_id}/{req.job_id}/{safe_name}.json"
 
-                        # ✅ NEW
-                        "download_url": f"/download/{user_id}/{data['pipeline_metadata']['job_id']}"
-                    })
+        blob = pipeline_service.blob_service.get_blob_client(
+            container="jobs",
+            blob=blob_path
+        )
 
-        return results
+        if blob.exists():
+            raise HTTPException(status_code=409, detail="Job already exists")
+
+        job_data = {
+            "job_id": req.job_id,
+            "job_name": req.job_name,
+            "user_id": req.user_id,
+            "dataset_name": dataset_name,
+            "dataset_path": dataset_blob
+        }
+
+        blob.upload_blob(json.dumps(job_data, indent=2), overwrite=False)
+
+        return {
+            "status": "success",
+            "job_name": req.job_name,
+            "dataset_name": dataset_name
+        }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# =========================
+# RENAME DATASET
+# =========================
+@app.post("/rename-dataset")
+def rename_dataset(req: RenameDatasetRequest):
+    try:
+        blob_service = BlobServiceClient.from_connection_string(V_CONNECTION_STRING)
+        container = blob_service.get_container_client(V_DATASET_CONTAINER)
+
+        old_blob_path = f"{req.user_id}/{req.job_id}/{req.old_name}"
+        new_blob_path = f"{req.user_id}/{req.job_id}/{req.new_name}"
+
+        old_blob = container.get_blob_client(old_blob_path)
+        new_blob = container.get_blob_client(new_blob_path)
+
+        if not old_blob.exists():
+            raise HTTPException(status_code=404, detail="Dataset not found")
+
+        # copy
+        new_blob.start_copy_from_url(old_blob.url)
+
+        # delete old
+        old_blob.delete_blob()
+
+        # update job metadata
+        jobs_container = pipeline_service.blob_service.get_container_client("jobs")
+
+        blobs = jobs_container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
+
+        for b in blobs:
+            job_blob = jobs_container.get_blob_client(b.name)
+            data = json.loads(job_blob.download_blob().readall())
+
+            data["dataset_name"] = req.new_name
+            data["dataset_path"] = new_blob_path
+
+            job_blob.upload_blob(json.dumps(data, indent=2), overwrite=True)
+
+        return {
+            "status": "success",
+            "new_name": req.new_name
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# LIST JOBS
+# =========================
+@app.get("/jobs/{user_id}")
+def get_jobs(user_id: str):
+    try:
+        container = pipeline_service.blob_service.get_container_client("jobs")
+        blobs = container.list_blobs(name_starts_with=f"{user_id}/")
+
+        jobs = []
+
+        for blob in blobs:
+            if blob.name.endswith(".json"):
+                blob_client = container.get_blob_client(blob.name)
+                data = json.loads(blob_client.download_blob().readall())
+
+                jobs.append({
+                    "job_id": data.get("job_id"),
+                    "job_name": data.get("job_name"),
+                    "dataset_name": data.get("dataset_name"),
+                    "dataset_path": data.get("dataset_path")
+                })
+
+        return jobs
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# JOB DETAILS
+# =========================
+@app.get("/jobs/{user_id}/{job_id}")
+def get_job_details(user_id: str, job_id: str):
+    try:
+        container = pipeline_service.blob_service.get_container_client("jobs")
+        blobs = container.list_blobs(name_starts_with=f"{user_id}/{job_id}/")
+
+        for blob in blobs:
+            if blob.name.endswith(".json"):
+                blob_client = container.get_blob_client(blob.name)
+                data = json.loads(blob_client.download_blob().readall())
+
+                return data
+
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # =========================
 # HEALTH
