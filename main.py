@@ -26,18 +26,22 @@ class RunRequest(BaseModel):
 class SaveJobRequest(BaseModel):
     user_id: str
     job_id: str
-    job_name: str
+
+
+class RenameJobRequest(BaseModel):
+    user_id: str
+    job_id: str
+    new_name: str
 
 
 class RenameDatasetRequest(BaseModel):
     user_id: str
     job_id: str
-    old_name: str
     new_name: str
 
 
 # =========================
-# RUN (NO SAVE)
+# RUN PIPELINE
 # =========================
 @app.post("/run")
 def run(req: RunRequest):
@@ -50,19 +54,28 @@ def run(req: RunRequest):
             job_id=job_id
         )
 
+        # Save temp result
+        temp_blob = pipeline_service.blob_service.get_blob_client(
+            container="jobs",
+            blob=f"{req.user_id}/{job_id}/temp_result.json"
+        )
+
+        temp_blob.upload_blob(json.dumps(result, indent=2), overwrite=True)
+
+        final_dataset = result.get("final_dataset")
+
         return {
             "status": "success",
             "job_id": job_id,
-
-            # 👇 suggested name
             "suggested_job_name": f"{result['data_model']['fact_table']}_job",
 
             "data_model": result.get("data_model"),
             "relationships": result.get("relationships"),
             "schemas": result.get("schemas"),
+            "final_dataset": final_dataset,
 
-            # 🔥 IMPORTANT: includes dataset_name + dataset_path
-            "final_dataset": result.get("final_dataset")
+            # 🔥 DOWNLOAD URL
+            "download_url": f"/download/{req.user_id}/{job_id}/{final_dataset['dataset_name']}"
         }
 
     except Exception as e:
@@ -70,81 +83,106 @@ def run(req: RunRequest):
 
 
 # =========================
-# SAVE JOB (WITH DATASET)
+# DOWNLOAD DATASET
+# =========================
+@app.get("/download/{user_id}/{job_id}/{file_name}")
+def download_dataset(user_id: str, job_id: str, file_name: str):
+    try:
+        blob_client = pipeline_service.dataset_blob_service.get_blob_client(
+            container=V_DATASET_CONTAINER,
+            blob=f"{user_id}/{job_id}/{file_name}"
+        )
+
+        if not blob_client.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+
+        stream = blob_client.download_blob()
+
+        return StreamingResponse(
+            stream.chunks(),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f"attachment; filename={file_name}"
+            }
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# =========================
+# SAVE JOB (FULL RESULT)
 # =========================
 @app.post("/save-job")
 def save_job(req: SaveJobRequest):
     try:
-        safe_name = req.job_name.strip().replace(" ", "_").lower()
+        container = pipeline_service.blob_service.get_container_client("jobs")
 
-        # =========================
-        # FIND DATASET AUTOMATICALLY
-        # =========================
-        dataset_container = pipeline_service.dataset_blob_service.get_container_client(V_DATASET_CONTAINER)
+        # get temp result
+        temp_blob = container.get_blob_client(f"{req.user_id}/{req.job_id}/temp_result.json")
 
-        blobs = dataset_container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
+        if not temp_blob.exists():
+            raise HTTPException(status_code=404, detail="Run result not found")
 
-        dataset_blob = None
+        result = json.loads(temp_blob.download_blob().readall())
 
-        for b in blobs:
-            if b.name.endswith(".csv"):
-                dataset_blob = b.name
-                break
+        # 🔥 auto job name from result
+        fact_table = result["data_model"]["fact_table"]
+        job_name = f"{fact_table}_job"
 
-        if not dataset_blob:
-            raise HTTPException(status_code=404, detail="Dataset not found for this job")
+        safe_name = job_name.lower().replace(" ", "_")
 
-        dataset_name = dataset_blob.split("/")[-1]
-
-        # =========================
-        # SAVE JOB
-        # =========================
-        blob_path = f"{req.user_id}/{req.job_id}/{safe_name}.json"
-
-        blob = pipeline_service.blob_service.get_blob_client(
-            container="jobs",
-            blob=blob_path
+        final_blob = container.get_blob_client(
+            f"{req.user_id}/{req.job_id}/{safe_name}.json"
         )
 
-        if blob.exists():
+        if final_blob.exists():
             raise HTTPException(status_code=409, detail="Job already exists")
 
         job_data = {
             "job_id": req.job_id,
-            "job_name": req.job_name,
+            "job_name": job_name,
             "user_id": req.user_id,
-            "dataset_name": dataset_name,
-            "dataset_path": dataset_blob
+            "result": result
         }
 
-        blob.upload_blob(json.dumps(job_data, indent=2), overwrite=False)
+        final_blob.upload_blob(json.dumps(job_data, indent=2))
 
         return {
             "status": "success",
-            "job_name": req.job_name,
-            "dataset_name": dataset_name
+            "job_name": job_name
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+
 # =========================
-# RENAME DATASET
+# RENAME JOB
 # =========================
-@app.post("/rename-dataset")
-def rename_dataset(req: RenameDatasetRequest):
+@app.post("/rename-job")
+def rename_job(req: RenameJobRequest):
     try:
-        blob_service = BlobServiceClient.from_connection_string(V_CONNECTION_STRING)
-        container = blob_service.get_container_client(V_DATASET_CONTAINER)
+        container = pipeline_service.blob_service.get_container_client("jobs")
 
-        old_blob_path = f"{req.user_id}/{req.job_id}/{req.old_name}"
-        new_blob_path = f"{req.user_id}/{req.job_id}/{req.new_name}"
+        blobs = container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
 
-        old_blob = container.get_blob_client(old_blob_path)
+        current_blob = None
+
+        for b in blobs:
+            if b.name.endswith(".json") and "temp_result" not in b.name:
+                current_blob = b.name
+                break
+
+        if not current_blob:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        old_blob = container.get_blob_client(current_blob)
+
+        new_name_clean = req.new_name.strip().replace(" ", "_").lower()
+        new_blob_path = f"{req.user_id}/{req.job_id}/{new_name_clean}.json"
+
         new_blob = container.get_blob_client(new_blob_path)
-
-        if not old_blob.exists():
-            raise HTTPException(status_code=404, detail="Dataset not found")
 
         # copy
         new_blob.start_copy_from_url(old_blob.url)
@@ -152,19 +190,11 @@ def rename_dataset(req: RenameDatasetRequest):
         # delete old
         old_blob.delete_blob()
 
-        # update job metadata
-        jobs_container = pipeline_service.blob_service.get_container_client("jobs")
+        # update inside JSON
+        data = json.loads(new_blob.download_blob().readall())
+        data["job_name"] = req.new_name
 
-        blobs = jobs_container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
-
-        for b in blobs:
-            job_blob = jobs_container.get_blob_client(b.name)
-            data = json.loads(job_blob.download_blob().readall())
-
-            data["dataset_name"] = req.new_name
-            data["dataset_path"] = new_blob_path
-
-            job_blob.upload_blob(json.dumps(data, indent=2), overwrite=True)
+        new_blob.upload_blob(json.dumps(data, indent=2), overwrite=True)
 
         return {
             "status": "success",
@@ -176,7 +206,49 @@ def rename_dataset(req: RenameDatasetRequest):
 
 
 # =========================
-# LIST JOBS
+# RENAME DATASET
+# =========================
+@app.post("/rename-dataset")
+def rename_dataset(req: RenameDatasetRequest):
+    try:
+        blob_service = BlobServiceClient.from_connection_string(V_CONNECTION_STRING)
+        container = blob_service.get_container_client(V_DATASET_CONTAINER)
+
+        blobs = container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
+
+        dataset_blob = None
+
+        for b in blobs:
+            if b.name.endswith(".csv"):
+                dataset_blob = b.name
+                break
+
+        if not dataset_blob:
+            raise HTTPException(status_code=404, detail="Dataset not found")
+
+        old_blob = container.get_blob_client(dataset_blob)
+
+        new_name_clean = req.new_name.strip().replace(" ", "_")
+        new_blob_path = f"{req.user_id}/{req.job_id}/{new_name_clean}"
+
+        new_blob = container.get_blob_client(new_blob_path)
+
+        # copy
+        new_blob.start_copy_from_url(old_blob.url)
+
+        # delete old
+        old_blob.delete_blob()
+
+        return {
+            "status": "success",
+            "new_name": req.new_name
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    
+# =========================
+# GET JOBS
 # =========================
 @app.get("/jobs/{user_id}")
 def get_jobs(user_id: str):
@@ -187,15 +259,18 @@ def get_jobs(user_id: str):
         jobs = []
 
         for blob in blobs:
-            if blob.name.endswith(".json"):
-                blob_client = container.get_blob_client(blob.name)
-                data = json.loads(blob_client.download_blob().readall())
+            if blob.name.endswith(".json") and "temp_result" not in blob.name:
+                data = json.loads(
+                    container.get_blob_client(blob.name).download_blob().readall()
+                )
+
+                result = data.get("result", {})
 
                 jobs.append({
                     "job_id": data.get("job_id"),
                     "job_name": data.get("job_name"),
-                    "dataset_name": data.get("dataset_name"),
-                    "dataset_path": data.get("dataset_path")
+                    "status": "success",
+                    **result
                 })
 
         return jobs
@@ -205,20 +280,29 @@ def get_jobs(user_id: str):
 
 
 # =========================
-# JOB DETAILS
+# GET JOB DETAILS
 # =========================
 @app.get("/jobs/{user_id}/{job_id}")
 def get_job_details(user_id: str, job_id: str):
     try:
         container = pipeline_service.blob_service.get_container_client("jobs")
+
         blobs = container.list_blobs(name_starts_with=f"{user_id}/{job_id}/")
 
         for blob in blobs:
-            if blob.name.endswith(".json"):
-                blob_client = container.get_blob_client(blob.name)
-                data = json.loads(blob_client.download_blob().readall())
+            if blob.name.endswith(".json") and "temp_result" not in blob.name:
+                data = json.loads(
+                    container.get_blob_client(blob.name).download_blob().readall()
+                )
 
-                return data
+                result = data.get("result", {})
+
+                return {
+                    "status": "success",
+                    "job_id": job_id,
+                    "job_name": data.get("job_name"),
+                    **result
+                }
 
         raise HTTPException(status_code=404, detail="Job not found")
 
