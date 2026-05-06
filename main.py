@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse,JSONResponse
 from pydantic import BaseModel
 from typing import Optional
 import uuid
@@ -9,6 +9,10 @@ from azure.storage.blob import BlobServiceClient
 
 from services.pipeline_service import PipelineService
 from config import BLOB_CONN_STR, V_CONNECTION_STRING, V_DATASET_CONTAINER
+from services.powerbi_service import (
+    generate_powerbi_dashboard,
+    sanitize_for_json
+)
 
 app = FastAPI(title="Job Execution System")
 
@@ -39,6 +43,9 @@ class RenameDatasetRequest(BaseModel):
     job_id: str
     new_name: str
 
+class PowerBIDashboardRequest(BaseModel):
+    csv_blob: str     # e.g. "folder/myfile.csv"
+    user_prompt: str 
 
 # =========================
 # RUN PIPELINE
@@ -309,7 +316,14 @@ def get_job_details(user_id: str, job_id: str):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
+@app.post("/generate_powerbi_dashboard")
+def generate_dashboard(req: PowerBIDashboardRequest):
+   
+    try:
+        result = generate_powerbi_dashboard(req.csv_blob, req.user_prompt)
+        return JSONResponse(content=sanitize_for_json(result))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 # =========================
 # HEALTH
 # =========================
