@@ -7,8 +7,11 @@ import json
 
 from azure.storage.blob import BlobServiceClient
 
+from services.onelake_service import OneLakeService
 from services.pipeline_service import PipelineService
 from config import BLOB_CONN_STR, V_CONNECTION_STRING, V_DATASET_CONTAINER
+# from services.onelake_service import OneLakeService
+
 from services.powerbi_service import (
     generate_powerbi_dashboard,
     sanitize_for_json
@@ -43,9 +46,11 @@ class RenameDatasetRequest(BaseModel):
     job_id: str
     new_name: str
 
+
 class PowerBIDashboardRequest(BaseModel):
     csv_blob: str     # e.g. "folder/myfile.csv"
     user_prompt: str 
+
 
 # =========================
 # RUN PIPELINE
@@ -125,7 +130,9 @@ def save_job(req: SaveJobRequest):
     try:
         container = pipeline_service.blob_service.get_container_client("jobs")
 
-        # get temp result
+        # =========================
+        # STEP 1: READ TEMP RESULT
+        # =========================
         temp_blob = container.get_blob_client(f"{req.user_id}/{req.job_id}/temp_result.json")
 
         if not temp_blob.exists():
@@ -133,8 +140,46 @@ def save_job(req: SaveJobRequest):
 
         result = json.loads(temp_blob.download_blob().readall())
 
-        # 🔥 auto job name from result
-        fact_table = result["data_model"]["fact_table"]
+        # =========================
+        # STEP 2: GET DATASET INFO
+        # =========================
+        final_dataset = result.get("final_dataset", {})
+
+        dataset_name = final_dataset.get("dataset_name")
+        dataset_path = final_dataset.get("dataset_path")
+
+        if not dataset_name or not dataset_path:
+            raise HTTPException(status_code=400, detail="Dataset info missing")
+
+        # =========================
+        # STEP 3: VERIFY DATASET IN BLOB
+        # =========================
+        dataset_blob = pipeline_service.dataset_blob_service.get_blob_client(
+            container=V_DATASET_CONTAINER,
+            blob=dataset_path
+        )
+
+        if not dataset_blob.exists():
+            raise HTTPException(status_code=404, detail="Dataset not found in dataset container")
+
+        # =========================
+        # STEP 4: ENSURE DATASET IN ONELAKE
+        # =========================
+        try:
+            # Try upload (overwrite safe)
+            pipeline_service.onelake.upload_file(
+                file_buffer=dataset_blob.download_blob().readall(),
+                user_id=req.user_id,
+                job_id=req.job_id,
+                dataset_name=dataset_name
+            )
+        except Exception as e:
+            print("OneLake sync skipped:", str(e))
+
+        # =========================
+        # STEP 5: AUTO GENERATE JOB NAME
+        # =========================
+        fact_table = result.get("data_model", {}).get("fact_table", "job")
         job_name = f"{fact_table}_job"
 
         safe_name = job_name.lower().replace(" ", "_")
@@ -146,6 +191,9 @@ def save_job(req: SaveJobRequest):
         if final_blob.exists():
             raise HTTPException(status_code=409, detail="Job already exists")
 
+        # =========================
+        # STEP 6: SAVE FULL RESULT
+        # =========================
         job_data = {
             "job_id": req.job_id,
             "job_name": job_name,
@@ -157,7 +205,8 @@ def save_job(req: SaveJobRequest):
 
         return {
             "status": "success",
-            "job_name": job_name
+            "job_name": job_name,
+            "dataset_name": dataset_name
         }
 
     except Exception as e:
@@ -175,7 +224,6 @@ def rename_job(req: RenameJobRequest):
         blobs = container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
 
         current_blob = None
-
         for b in blobs:
             if b.name.endswith(".json") and "temp_result" not in b.name:
                 current_blob = b.name
@@ -186,22 +234,22 @@ def rename_job(req: RenameJobRequest):
 
         old_blob = container.get_blob_client(current_blob)
 
+        # ✅ Read existing data safely
+        data = json.loads(old_blob.download_blob().readall())
+
+        # ✅ Update job name
+        data["job_name"] = req.new_name
+
         new_name_clean = req.new_name.strip().replace(" ", "_").lower()
         new_blob_path = f"{req.user_id}/{req.job_id}/{new_name_clean}.json"
 
         new_blob = container.get_blob_client(new_blob_path)
 
-        # copy
-        new_blob.start_copy_from_url(old_blob.url)
-
-        # delete old
-        old_blob.delete_blob()
-
-        # update inside JSON
-        data = json.loads(new_blob.download_blob().readall())
-        data["job_name"] = req.new_name
-
+        # ✅ Save updated JSON first
         new_blob.upload_blob(json.dumps(data, indent=2), overwrite=True)
+
+        # ✅ Delete old blob
+        old_blob.delete_blob()
 
         return {
             "status": "success",
@@ -218,40 +266,122 @@ def rename_job(req: RenameJobRequest):
 @app.post("/rename-dataset")
 def rename_dataset(req: RenameDatasetRequest):
     try:
+        print("\n🔁 RENAME DATASET STARTED")
+
+        # =========================
+        # STEP 1: GET JOB JSON
+        # =========================
+        jobs_container = pipeline_service.blob_service.get_container_client("jobs")
+
+        job_blob = None
+        for b in jobs_container.list_blobs(
+            name_starts_with=f"{req.user_id}/{req.job_id}/"
+        ):
+            if b.name.endswith(".json") and "temp_result" not in b.name:
+                job_blob = jobs_container.get_blob_client(b.name)
+                break
+
+        if not job_blob:
+            raise HTTPException(status_code=404, detail="Job not found")
+
+        data = json.loads(job_blob.download_blob().readall())
+
+        # =========================
+        # STEP 2: GET DATASET INFO
+        # =========================
+        result = data.get("result", data)
+        final_dataset = result.get("final_dataset", {})
+
+        old_dataset_name = final_dataset.get("dataset_name")
+        old_blob_path = final_dataset.get("dataset_path")
+        onelake_path = final_dataset.get("onelake_path")  # 🔥 KEEP SAME
+
+        if not old_dataset_name or not old_blob_path:
+            raise HTTPException(status_code=404, detail="Dataset info missing")
+
+        print("OLD DATASET:", old_dataset_name)
+        print("OLD BLOB PATH:", old_blob_path)
+
+        # =========================
+        # STEP 3: PREPARE NEW NAME
+        # =========================
+        new_name_clean = req.new_name.strip().replace(" ", "_")
+
+        if not new_name_clean.endswith(".csv"):
+            new_name_clean += ".csv"
+
+        new_blob_path = f"{req.user_id}/{req.job_id}/{new_name_clean}"
+
+        print("NEW DATASET:", new_name_clean)
+        print("NEW BLOB PATH:", new_blob_path)
+
+        # =========================
+        # STEP 4: BLOB RENAME (SAFE)
+        # =========================
         blob_service = BlobServiceClient.from_connection_string(V_CONNECTION_STRING)
         container = blob_service.get_container_client(V_DATASET_CONTAINER)
 
-        blobs = container.list_blobs(name_starts_with=f"{req.user_id}/{req.job_id}/")
+        old_blob = container.get_blob_client(old_blob_path)
 
-        dataset_blob = None
+        if not old_blob.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Dataset blob not found: {old_blob_path}"
+            )
 
-        for b in blobs:
-            if b.name.endswith(".csv"):
-                dataset_blob = b.name
-                break
+        if old_dataset_name != new_name_clean:
+            new_blob = container.get_blob_client(new_blob_path)
 
-        if not dataset_blob:
-            raise HTTPException(status_code=404, detail="Dataset not found")
+            print("📦 Copying blob...")
 
-        old_blob = container.get_blob_client(dataset_blob)
+            copy = new_blob.start_copy_from_url(old_blob.url)
 
-        new_name_clean = req.new_name.strip().replace(" ", "_")
-        new_blob_path = f"{req.user_id}/{req.job_id}/{new_name_clean}"
+            props = new_blob.get_blob_properties()
+            while props.copy.status == "pending":
+                props = new_blob.get_blob_properties()
 
-        new_blob = container.get_blob_client(new_blob_path)
+            if props.copy.status != "success":
+                raise Exception("Blob copy failed")
 
-        # copy
-        new_blob.start_copy_from_url(old_blob.url)
+            print("✅ Copy completed")
 
-        # delete old
-        old_blob.delete_blob()
+            old_blob.delete_blob()
+            print("🗑️ Old blob deleted")
+
+        else:
+            print("⚠️ Same name — skipping blob rename")
+
+        # =========================
+        # STEP 5: ONE LAKE (SKIP)
+        # =========================
+        print("ℹ️ Skipping OneLake rename (not supported reliably)")
+
+        # =========================
+        # STEP 6: UPDATE JOB JSON
+        # =========================
+        if "result" in data and "final_dataset" in data["result"]:
+            data["result"]["final_dataset"]["dataset_name"] = new_name_clean
+            data["result"]["final_dataset"]["dataset_path"] = new_blob_path
+            data["result"]["final_dataset"]["onelake_path"] = onelake_path  # 🔥 unchanged
+        else:
+            data["final_dataset"]["dataset_name"] = new_name_clean
+            data["final_dataset"]["dataset_path"] = new_blob_path
+            data["final_dataset"]["onelake_path"] = onelake_path  # 🔥 unchanged
+
+        job_blob.upload_blob(json.dumps(data, indent=2), overwrite=True)
+
+        print("💾 Job JSON updated")
 
         return {
             "status": "success",
-            "new_name": req.new_name
+            "old_dataset_name": old_dataset_name,
+            "new_dataset_name": new_name_clean,
+            "dataset_path": new_blob_path,
+            "onelake_path": onelake_path
         }
 
     except Exception as e:
+        print("❌ ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
     
 # =========================
@@ -273,11 +403,16 @@ def get_jobs(user_id: str):
 
                 result = data.get("result", {})
 
+                dataset_name = result.get("final_dataset", {}).get("dataset_name")
+
                 jobs.append({
                     "job_id": data.get("job_id"),
                     "job_name": data.get("job_name"),
                     "status": "success",
-                    **result
+                    **result,
+
+                    # 🔥 NEW
+                    "download_url": f"/download/{user_id}/{data.get('job_id')}/{dataset_name}"
                 })
 
         return jobs
@@ -304,11 +439,16 @@ def get_job_details(user_id: str, job_id: str):
 
                 result = data.get("result", {})
 
+                dataset_name = result.get("final_dataset", {}).get("dataset_name")
+
                 return {
                     "status": "success",
                     "job_id": job_id,
                     "job_name": data.get("job_name"),
-                    **result
+                    **result,
+
+                    # 🔥 NEW
+                    "download_url": f"/download/{user_id}/{job_id}/{dataset_name}"
                 }
 
         raise HTTPException(status_code=404, detail="Job not found")
@@ -324,6 +464,7 @@ def generate_dashboard(req: PowerBIDashboardRequest):
         return JSONResponse(content=sanitize_for_json(result))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
 # =========================
 # HEALTH
 # =========================
