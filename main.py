@@ -1,3 +1,6 @@
+
+from datetime import datetime
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse,JSONResponse
 from pydantic import BaseModel
@@ -6,11 +9,15 @@ import uuid
 import json
 
 from azure.storage.blob import BlobServiceClient
+import requests
 
-from services.onelake_service import OneLakeService
 from services.pipeline_service import PipelineService
 from config import BLOB_CONN_STR, V_CONNECTION_STRING, V_DATASET_CONTAINER
 # from services.onelake_service import OneLakeService
+
+from services.thread_service import ThreadService
+
+thread_service = ThreadService()
 
 from services.powerbi_service import (
     generate_powerbi_dashboard,
@@ -33,6 +40,10 @@ class RunRequest(BaseModel):
 class SaveJobRequest(BaseModel):
     user_id: str
     job_id: str
+    dataset: str
+    onelake_path: str   # 🔥 IMPORTANT
+    session_id: str
+    user_email: str
 
 
 class RenameJobRequest(BaseModel):
@@ -48,8 +59,17 @@ class RenameDatasetRequest(BaseModel):
 
 
 class PowerBIDashboardRequest(BaseModel):
-    csv_blob: str     # e.g. "folder/myfile.csv"
-    user_prompt: str 
+    csv_blob: str
+    user_prompt: str
+    user_id: str       # 🔥 ADD
+    job_id: str        # 🔥 ADD
+
+class AutoMLRequest(BaseModel):
+    user_id: str
+    job_id: str
+    session_id: str
+    user_email: str
+    query: str
 
 
 # =========================
@@ -58,22 +78,54 @@ class PowerBIDashboardRequest(BaseModel):
 @app.post("/run")
 def run(req: RunRequest):
     try:
-        job_id = req.job_id or str(uuid.uuid4())
+        print("\n🚀 PIPELINE STARTED")
 
+        job_id = req.job_id or str(uuid.uuid4())
+        user_id = req.user_id
+
+        # =========================
+        # STEP 1: RUN PIPELINE
+        # =========================
         result = pipeline_service.run(
             prompt=req.prompt,
-            user_id=req.user_id,
+            user_id=user_id,
             job_id=job_id
         )
 
-        # Save temp result
+        print("✅ Pipeline completed")
+
+        # =========================
+        # STEP 2: SAVE TEMP RESULT (existing)
+        # =========================
         temp_blob = pipeline_service.blob_service.get_blob_client(
             container="jobs",
-            blob=f"{req.user_id}/{job_id}/temp_result.json"
+            blob=f"{user_id}/{job_id}/temp_result.json"
         )
 
         temp_blob.upload_blob(json.dumps(result, indent=2), overwrite=True)
 
+        print("💾 Temp result saved")
+
+        # =========================
+        # STEP 3: SAVE ETL RESULT TO THREAD 🔥
+        # =========================
+        try:
+            print("🧠 Saving ETL result to thread...")
+
+            thread_service.add_action(user_id, job_id, {
+                "type": "etl",
+                "prompt": req.prompt,
+                "response": result
+            })
+
+            print("✅ ETL saved in thread")
+
+        except Exception as e:
+            print("⚠️ Thread save failed:", str(e))
+
+        # =========================
+        # STEP 4: PREPARE RESPONSE
+        # =========================
         final_dataset = result.get("final_dataset")
 
         return {
@@ -86,11 +138,11 @@ def run(req: RunRequest):
             "schemas": result.get("schemas"),
             "final_dataset": final_dataset,
 
-            # 🔥 DOWNLOAD URL
-            "download_url": f"/download/{req.user_id}/{job_id}/{final_dataset['dataset_name']}"
+            "download_url": f"/download/{user_id}/{job_id}/{final_dataset['dataset_name']}"
         }
 
     except Exception as e:
+        print("❌ PIPELINE ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -125,93 +177,130 @@ def download_dataset(user_id: str, job_id: str, file_name: str):
 # =========================
 # SAVE JOB (FULL RESULT)
 # =========================
+from fastapi import HTTPException
+from datetime import datetime
+import json
+import requests
+
 @app.post("/save-job")
 def save_job(req: SaveJobRequest):
     try:
-        container = pipeline_service.blob_service.get_container_client("jobs")
+        print("\n💾 SAVE JOB STARTED")
+
+        user_id = req.user_id
+        job_id = req.job_id
 
         # =========================
-        # STEP 1: READ TEMP RESULT
+        # STEP 1: GET TEMP RESULT
         # =========================
-        temp_blob = container.get_blob_client(f"{req.user_id}/{req.job_id}/temp_result.json")
+        temp_blob = pipeline_service.blob_service.get_blob_client(
+            container="jobs",
+            blob=f"{user_id}/{job_id}/temp_result.json"
+        )
 
         if not temp_blob.exists():
-            raise HTTPException(status_code=404, detail="Run result not found")
+            raise HTTPException(status_code=404, detail="Temp result not found. Run pipeline first.")
 
         result = json.loads(temp_blob.download_blob().readall())
 
-        # =========================
-        # STEP 2: GET DATASET INFO
-        # =========================
-        final_dataset = result.get("final_dataset", {})
-
-        dataset_name = final_dataset.get("dataset_name")
-        dataset_path = final_dataset.get("dataset_path")
-
-        if not dataset_name or not dataset_path:
-            raise HTTPException(status_code=400, detail="Dataset info missing")
+        print("✅ Temp result loaded")
 
         # =========================
-        # STEP 3: VERIFY DATASET IN BLOB
+        # STEP 2: SAVE FINAL JOB JSON
         # =========================
-        dataset_blob = pipeline_service.dataset_blob_service.get_blob_client(
-            container=V_DATASET_CONTAINER,
-            blob=dataset_path
+        job_blob = pipeline_service.blob_service.get_blob_client(
+            container="jobs",
+            blob=f"{user_id}/{job_id}/job.json"
         )
 
-        if not dataset_blob.exists():
-            raise HTTPException(status_code=404, detail="Dataset not found in dataset container")
-
-        # =========================
-        # STEP 4: ENSURE DATASET IN ONELAKE
-        # =========================
-        try:
-            # Try upload (overwrite safe)
-            pipeline_service.onelake.upload_file(
-                file_buffer=dataset_blob.download_blob().readall(),
-                user_id=req.user_id,
-                job_id=req.job_id,
-                dataset_name=dataset_name
-            )
-        except Exception as e:
-            print("OneLake sync skipped:", str(e))
-
-        # =========================
-        # STEP 5: AUTO GENERATE JOB NAME
-        # =========================
-        fact_table = result.get("data_model", {}).get("fact_table", "job")
-        job_name = f"{fact_table}_job"
-
-        safe_name = job_name.lower().replace(" ", "_")
-
-        final_blob = container.get_blob_client(
-            f"{req.user_id}/{req.job_id}/{safe_name}.json"
-        )
-
-        if final_blob.exists():
-            raise HTTPException(status_code=409, detail="Job already exists")
-
-        # =========================
-        # STEP 6: SAVE FULL RESULT
-        # =========================
         job_data = {
-            "job_id": req.job_id,
-            "job_name": job_name,
-            "user_id": req.user_id,
+            "user_id": user_id,
+            "job_id": job_id,
+            "created_at": datetime.utcnow().isoformat(),
             "result": result
         }
 
-        final_blob.upload_blob(json.dumps(job_data, indent=2))
+        job_blob.upload_blob(json.dumps(job_data, indent=2), overwrite=True)
 
+        print("✅ Job saved to jobs container")
+
+        # =========================
+        # STEP 3: REGISTER DATASET WITH AUTOML
+        # =========================
+        upload_result = {}
+
+        try:
+            print("📡 Registering dataset with AutoML...")
+
+            upload_url = "https://api.veriton.ai/api/service3/upload_file_V"
+
+            onelake_path = result.get("final_dataset", {}).get("onelake_path")
+
+            print("📁 OneLake Path:", onelake_path)
+
+            if not onelake_path:
+                raise Exception("onelake_path missing in result")
+
+            response = requests.post(
+                upload_url,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                data={
+                    "file_path": onelake_path,
+                    "session_id": req.session_id,
+                    "user_email": req.user_email,
+                    "query": ""
+                }
+            )
+
+            print("🔍 Status Code:", response.status_code)
+            print("🔍 Raw Response:", response.text)
+
+            # SAFE JSON PARSE
+            try:
+                upload_result = response.json()
+            except Exception:
+                upload_result = {
+                    "error": "Invalid JSON response",
+                    "raw_response": response.text
+                }
+
+            if response.status_code != 200:
+                print("⚠️ AutoML upload failed")
+
+            print("✅ AutoML upload processed")
+
+        except Exception as e:
+            print("⚠️ AutoML upload exception:", str(e))
+            upload_result = {"error": str(e)}
+
+        # =========================
+        # STEP 4: SAVE IN THREAD 🔥
+        # =========================
+        try:
+            print("🧠 Saving upload result to thread...")
+
+            thread_service.add_action(user_id, job_id, {
+                "type": "file_upload",
+                "response": upload_result
+            })
+
+            print("✅ Thread updated")
+
+        except Exception as e:
+            print("⚠️ Thread save failed:", str(e))
+
+        # =========================
+        # STEP 5: RETURN RESPONSE
+        # =========================
         return {
             "status": "success",
-            "job_name": job_name,
-            "dataset_name": dataset_name
+            "job_id": job_id,
+            "upload_result": upload_result
         }
 
     except Exception as e:
+        print("❌ SAVE JOB ERROR:", str(e))
         raise HTTPException(status_code=500, detail=str(e))
-
 
 # =========================
 # RENAME JOB
@@ -455,13 +544,148 @@ def get_job_details(user_id: str, job_id: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+    
+#####power-bi
 @app.post("/generate_powerbi_dashboard")
 def generate_dashboard(req: PowerBIDashboardRequest):
-   
+
     try:
+        print("\n📊 POWERBI GENERATION STARTED")
+
+        # =========================
+        # STEP 1: GENERATE DASHBOARD
+        # =========================
         result = generate_powerbi_dashboard(req.csv_blob, req.user_prompt)
-        return JSONResponse(content=sanitize_for_json(result))
+
+        clean_result = sanitize_for_json(result)
+
+        print("✅ PowerBI generated")
+
+        # =========================
+        # STEP 2: SAVE TO THREAD 🔥
+        # =========================
+        try:
+            print("🧠 Saving PowerBI result to thread...")
+
+            thread_service.add_action(req.user_id, req.job_id, {
+                "type": "powerbi",
+                "prompt": req.user_prompt,
+                "response": clean_result
+            })
+
+            print("✅ PowerBI saved in thread")
+
+        except Exception as e:
+            print("⚠️ Thread save failed:", str(e))
+
+        # =========================
+        # STEP 3: RETURN RESPONSE
+        # =========================
+        return JSONResponse(content=clean_result)
+
+    except Exception as e:
+        print("❌ POWERBI ERROR:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    
+####automl-run    
+@app.post("/automl/run")
+def run_automl(req: AutoMLRequest):
+    try:
+        print("🚀 Starting AutoML...")
+
+        start_url = "https://api.veriton.ai/api/service3/process_task_query_v"
+
+        # =========================
+        # STEP 1: START JOB
+        # =========================
+        start_res = requests.post(
+            start_url,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            data={
+                "session_id": req.session_id,
+                "query": req.query,
+                "user_email": req.user_email
+            }
+        ).json()
+
+        if start_res.get("status") != "started":
+            raise Exception("Failed to start AutoML")
+
+        job_id_ext = start_res.get("job_id")
+
+        print("🧠 Job started:", job_id_ext)
+
+        # =========================
+        # STEP 2: POLL STATUS API
+        # =========================
+        status_url = f"https://api.veriton.ai/api/service3/process-task-query-status/{job_id_ext}"
+
+        import time
+
+        while True:
+            time.sleep(start_res.get("poll_every_seconds", 10))
+
+            poll_res = requests.get(
+                status_url,
+                params={"user_email": req.user_email}
+            ).json()
+
+            status = poll_res.get("status")
+
+            print("⏳ Status:", status)
+
+            if status == "success":
+                print("✅ AutoML completed")
+
+                # 🔥 SAVE IN THREAD
+                thread_service.add_action(req.user_id, req.job_id, {
+                    "type": "automl",
+                    "prompt": req.query,
+                    "response": poll_res
+                })
+
+                return poll_res
+
+            elif status == "failed":
+                raise Exception("AutoML job failed")
+
+    except Exception as e:
+        print("❌ AutoML error:", str(e))
+        raise HTTPException(status_code=500, detail=str(e))
+    
+from fastapi import HTTPException
+
+####threads
+@app.get("/threads")
+def get_thread(user_id: str, job_id: str):
+    try:
+        thread = thread_service.get_thread(user_id, job_id)
+
+        # 🔎 derive “latest artifacts” for convenience
+        latest = {
+            "etl": None,
+            "file_upload": None,
+            "automl": None,
+            "powerbi": None
+        }
+
+        for act in thread.get("actions", []):
+            t = act.get("type")
+            if t in latest:
+                latest[t] = act  # last one wins
+
+        return {
+            "status": "success",
+            "thread_id": thread.get("thread_id"),
+            "user_id": thread.get("user_id"),
+            "job_id": thread.get("job_id"),
+            "created_at": thread.get("created_at"),
+            "job_summary": thread.get("job_summary", {}),
+            "messages": thread.get("messages", []),
+            "actions": thread.get("actions", []),
+            "latest": latest
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
