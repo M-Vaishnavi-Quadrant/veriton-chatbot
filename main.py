@@ -23,9 +23,19 @@ from services.powerbi_service import (
     sanitize_for_json
 )
 
+from services.pipeline_manager import PipelineManager
+from services.schedule_service import ScheduleService
+from collections import defaultdict
+from services.scheduler_service import schedule_pipeline
+
+pipeline_manager = PipelineManager()
+
+# chat state (in-memory for now)
+state_store = defaultdict(dict)
 app = FastAPI(title="Job Execution System")
 
 pipeline_service = PipelineService()
+schedule_service = ScheduleService()
 
 # =========================
 # REQUEST MODELS
@@ -69,6 +79,12 @@ class AutoMLRequest(BaseModel):
     session_id: str
     user_email: str
     query: str
+
+class ChatRequest(BaseModel):
+    user_id: str
+    job_id: str
+    message: str
+    selected_jobs: list[str] = []
 
 
 # =========================
@@ -673,6 +689,272 @@ def get_thread(user_id: str, job_id: str):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# =========================
+#get user jobs
+# =========================
+def get_user_jobs(user_id):
+
+    container = pipeline_service.blob_service.get_container_client("jobs")
+
+    jobs = []
+    seen = set()
+
+    for blob in container.list_blobs(name_starts_with=f"{user_id}/"):
+
+        if blob.name.endswith(".json") and "temp_result" not in blob.name:
+
+            blob_client = container.get_blob_client(blob.name)
+            data = json.loads(blob_client.download_blob().readall())
+
+            job_id = data.get("job_id")
+
+            if job_id in seen:
+                continue
+
+            seen.add(job_id)
+
+            jobs.append({
+                "job_id": job_id,
+                "job_name": data.get("job_name", f"Job {job_id[:6]}")
+            })
+
+    return jobs
+
+# =========================
+# RUN PIPELINE
+# =========================
+def run_pipeline_execution(user_id, pipeline_id):
+
+    print(f"\n🚀 Running pipeline: {pipeline_id}")
+
+    pipeline = pipeline_manager.get_pipeline(user_id, pipeline_id)
+
+    for job_id in pipeline["jobs"]:
+        try:
+            result = pipeline_service.run(
+                prompt="pipeline run",
+                user_id=user_id,
+                job_id=job_id
+            )
+
+            thread_service.add_action(user_id, job_id, {
+                "type": "etl",
+                "prompt": "pipeline run",
+                "response": result
+            })
+
+        except Exception as e:
+            print("❌ Job failed:", job_id, str(e))
+
+# =========================
+# CHAT
+# =========================
+@app.post("/chat")
+def chat(req: ChatRequest):
+
+    user_id = req.user_id
+    message = req.message.lower().strip()
+
+    state = state_store[user_id]
+
+    print("STATE:", state)
+    print("MESSAGE:", message)
+
+    # =========================
+    # START PIPELINE FLOW
+    # =========================
+    if "pipeline" in message and "create" in message:
+
+        jobs = get_user_jobs(user_id)
+
+        state_store[user_id] = {
+            "stage": "select_jobs",
+            "jobs": jobs
+        }
+
+        return {
+            "response": "Select jobs for pipeline",
+            "jobs": jobs
+        }
+
+    # =========================
+    # SELECT JOBS
+    # =========================
+    if state.get("stage") == "select_jobs":
+
+        if not req.selected_jobs:
+            return {"response": "Please select at least one job"}
+
+        state["selected_jobs"] = req.selected_jobs
+        state["stage"] = "name_pipeline"
+
+        return {"response": "Enter pipeline name"}
+
+    # =========================
+    # PIPELINE NAME
+    # =========================
+    if state.get("stage") == "name_pipeline":
+
+        state["pipeline_name"] = req.message
+        state["stage"] = "ask_schedule"
+
+        return {"response": "Do you want to schedule it? (yes/no)"}
+
+    # =========================
+    # ASK SCHEDULE
+    # =========================
+    if state.get("stage") == "ask_schedule":
+
+        if "yes" in message:
+            state["stage"] = "schedule_type"
+            return {"response": "daily / weekly / monthly?"}
+        else:
+            pipeline = pipeline_manager.create_pipeline(
+                user_id,
+                state["pipeline_name"],
+                state["selected_jobs"]
+            )
+
+            state_store[user_id] = {}
+
+            return {
+                "response": "Pipeline created successfully",
+                "pipeline": pipeline
+            }
+
+    # =========================
+    # SCHEDULE TYPE
+    # =========================
+    if state.get("stage") == "schedule_type":
+
+        if message not in ["daily", "weekly", "monthly"]:
+            return {"response": "Please choose: daily / weekly / monthly"}
+
+        state["schedule"] = {"type": message}
+
+        if message == "weekly":
+            state["stage"] = "schedule_day"
+            return {"response": "Enter day (0=Mon ... 6=Sun)"}
+
+        if message == "monthly":
+            state["stage"] = "schedule_day"
+            return {"response": "Enter date (1-31)"}
+
+        state["stage"] = "schedule_time"
+        return {"response": "Enter time (HH:MM)"}
+
+    # =========================
+    # DAY INPUT
+    # =========================
+    if state.get("stage") == "schedule_day":
+
+        state["schedule"]["day"] = message
+        state["stage"] = "schedule_time"
+
+        return {"response": "Enter time (HH:MM)"}
+
+    # =========================
+    # TIME INPUT (🔥 FIXED BLOCK)
+    # =========================
+    if state.get("stage") == "schedule_time":
+
+        try:
+            hour, minute = map(int, message.split(":"))
+        except:
+            return {"response": "Invalid time format. Use HH:MM"}
+
+        schedule = state["schedule"]
+        schedule["hour"] = hour
+        schedule["minute"] = minute
+
+        # CREATE PIPELINE
+        pipeline = pipeline_manager.create_pipeline(
+            user_id,
+            state["pipeline_name"],
+            state["selected_jobs"]
+        )
+
+        # SAVE SCHEDULE IN PIPELINE
+        pipeline_manager.update_schedule(
+            user_id,
+            pipeline["pipeline_id"],
+            schedule
+        )
+
+        # SAVE SCHEDULE IN BLOB
+        schedule_service.save_schedule({
+            "user_id": user_id,
+            "pipeline_id": pipeline["pipeline_id"],
+            "schedule": schedule
+        })
+
+        # REGISTER SCHEDULER
+        schedule_pipeline(
+            run_pipeline_execution,
+            user_id,
+            pipeline["pipeline_id"],
+            schedule
+        )
+
+        # RESET STATE
+        state_store[user_id] = {}
+
+        # FETCH UPDATED PIPELINE
+        pipeline = pipeline_manager.get_pipeline(
+            user_id,
+            pipeline["pipeline_id"]
+        )
+
+        return {
+            "response": "✅ Pipeline created and scheduled",
+            "pipeline": pipeline
+        }
+
+    return {"response": "I didn't understand"}
+
+# =========================
+# START UP
+# =========================
+@app.on_event("startup")
+def load_schedules():
+
+    print("🔄 Loading schedules from storage...")
+
+    schedules = schedule_service.get_all_schedules()
+
+    for s in schedules:
+        try:
+            schedule_pipeline(
+                run_pipeline_execution,
+                s["user_id"],
+                s["pipeline_id"],
+                s["schedule"]
+            )
+        except Exception as e:
+            print("⚠️ Failed to restore schedule:", str(e))
+
+# =========================
+# LIST PIPELINES
+# =========================
+@app.get("/pipelines")
+def get_pipelines(user_id: str):
+    return pipeline_manager.list_pipelines(user_id)
+
+# =========================
+# ADD JOB TO PIPELINE
+# =========================
+@app.post("/pipelines/add-job")
+def add_job_to_pipeline(user_id: str, pipeline_id: str, job_id: str):
+
+    pipeline = pipeline_manager.get_pipeline(user_id, pipeline_id)
+
+    if job_id not in pipeline["jobs"]:
+        pipeline["jobs"].append(job_id)
+
+    pipeline_manager.update_schedule(user_id, pipeline_id, pipeline.get("schedule"))
+
+    return pipeline
 
 # =========================
 # HEALTH
