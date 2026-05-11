@@ -9,6 +9,7 @@ import json
 
 from azure.storage.blob import BlobServiceClient
 import requests
+import re
 
 from services.pipeline_service import PipelineService
 from config import BLOB_CONN_STR, V_CONNECTION_STRING, V_DATASET_CONTAINER
@@ -87,6 +88,95 @@ class ChatRequest(BaseModel):
     selected_jobs: list[str] = []
 
 
+def extract_pipeline_name(message: str):
+    """
+    Extract pipeline name from flexible input.
+    Example:
+    - "sales pipeline daily 10:00" → "sales_pipeline"
+    - "orders weekly 2 11:00" → "orders"
+    """
+
+    message = message.lower()
+
+    keywords = ["daily", "weekly", "monthly", "no"]
+
+    words = message.split()
+
+    filtered = []
+
+    for w in words:
+        # stop at schedule keywords
+        if w in keywords:
+            break
+
+        # stop at time
+        if re.match(r"\d{1,2}:\d{2}", w):
+            break
+
+        filtered.append(w)
+
+    return "_".join(filtered) if filtered else "pipeline"
+
+def parse_pipeline_prompt(message: str):
+
+    import re
+
+    message = message.lower().strip()
+
+    # normalize bad inputs
+    message = message.replace(";", ":")
+    message = message.replace(" at ", " ")
+
+    pipeline_name = extract_pipeline_name(message)
+
+    if "no" in message:
+        return {"pipeline_name": pipeline_name, "schedule": None}
+
+    freq = None
+    for f in ["daily", "weekly", "monthly"]:
+        if f in message:
+            freq = f
+            break
+
+    time_match = re.search(r"\d{1,2}:\d{2}", message)
+
+    if not freq or not time_match:
+        return None
+
+    hour, minute = map(int, time_match.group().split(":"))
+
+    schedule = {
+        "type": freq,
+        "hour": hour,
+        "minute": minute
+    }
+
+    if freq == "weekly":
+
+        cleaned = re.sub(r"\d{1,2}:\d{2}", "", message)
+
+        day_match = re.search(r"\b[0-6]\b", cleaned)
+
+        if day_match:
+            schedule["day"] = day_match.group()
+
+    if freq == "monthly":
+
+        # 🔥 remove time first
+        cleaned = re.sub(r"\d{1,2}:\d{2}", "", message)
+
+        # now extract day
+        day_match = re.search(r"\b(0?[1-9]|[12][0-9]|3[01])\b", cleaned)
+
+        if day_match:
+            schedule["day"] = str(int(day_match.group()))  # normalize (02 → 2)
+
+    return {
+        "pipeline_name": pipeline_name,
+        "schedule": schedule
+    }
+
+
 # =========================
 # RUN PIPELINE
 # =========================
@@ -110,26 +200,48 @@ def run(req: RunRequest):
         print("✅ Pipeline completed")
 
         # =========================
-        # STEP 2: SAVE TEMP RESULT (existing)
+        # STEP 2: SAVE TEMP RESULT
         # =========================
         temp_blob = pipeline_service.blob_service.get_blob_client(
             container="jobs",
             blob=f"{user_id}/{job_id}/temp_result.json"
         )
 
-        temp_blob.upload_blob(json.dumps(result, indent=2), overwrite=True)
+        temp_blob.upload_blob(
+            json.dumps(result, indent=2),
+            overwrite=True
+        )
 
         print("💾 Temp result saved")
 
         # =========================
-        # STEP 3: SAVE ETL RESULT TO THREAD 🔥
+        # STEP 3: PREPARE SAFE DATA
+        # =========================
+        data_model = result.get("data_model") or {}
+        final_dataset = result.get("final_dataset") or {}
+
+        # ---- job_name ----
+        fact_table = data_model.get("fact_table")
+        job_name = f"{fact_table}_job" if fact_table else f"job_{job_id[:6]}"
+
+        # ---- download_url ----
+        dataset_name = final_dataset.get("dataset_name")
+        download_url = None
+        if dataset_name:
+            download_url = f"/download/{user_id}/{job_id}/{dataset_name}"
+
+        # =========================
+        # STEP 4: SAVE ETL RESULT TO THREAD 🔥
         # =========================
         try:
             print("🧠 Saving ETL result to thread...")
 
             thread_service.add_action(user_id, job_id, {
                 "type": "etl",
+                "job_id": job_id,
+                "job_name": job_name,
                 "prompt": req.prompt,
+                "download_url": download_url,
                 "response": result
             })
 
@@ -139,21 +251,19 @@ def run(req: RunRequest):
             print("⚠️ Thread save failed:", str(e))
 
         # =========================
-        # STEP 4: PREPARE RESPONSE
+        # STEP 5: RETURN RESPONSE
         # =========================
-        final_dataset = result.get("final_dataset")
-
         return {
             "status": "success",
             "job_id": job_id,
-            "suggested_job_name": f"{result['data_model']['fact_table']}_job",
+            "job_name": job_name,   # 🔥 added
 
-            "data_model": result.get("data_model"),
+            "data_model": data_model,
             "relationships": result.get("relationships"),
             "schemas": result.get("schemas"),
             "final_dataset": final_dataset,
 
-            "download_url": f"/download/{user_id}/{job_id}/{final_dataset['dataset_name']}"
+            "download_url": download_url
         }
 
     except Exception as e:
@@ -756,10 +866,67 @@ def chat(req: ChatRequest):
     user_id = req.user_id
     message = req.message.lower().strip()
 
-    state = state_store[user_id]
+    # ✅ SAFE STATE
+    state = state_store.get(user_id, {})
 
     print("STATE:", state)
     print("MESSAGE:", message)
+
+    # =========================
+    # 🔥 GLOBAL FAST PIPELINE CREATION (WORKS FROM ANY STATE)
+    # =========================
+    parsed = parse_pipeline_prompt(message)
+
+    if parsed and req.selected_jobs:
+
+        pipeline = pipeline_manager.create_pipeline(
+            user_id,
+            parsed["pipeline_name"],
+            req.selected_jobs
+        )
+
+        schedule = parsed["schedule"]
+
+        if schedule:
+            pipeline_manager.update_schedule(
+                user_id,
+                pipeline["pipeline_id"],
+                schedule
+            )
+
+            schedule_service.save_schedule({
+                "user_id": user_id,
+                "pipeline_id": pipeline["pipeline_id"],
+                "schedule": schedule
+            })
+
+            schedule_pipeline(
+                run_pipeline_execution,
+                user_id,
+                pipeline["pipeline_id"],
+                schedule
+            )
+
+            pipeline = pipeline_manager.get_pipeline(
+                user_id,
+                pipeline["pipeline_id"]
+            )
+
+            return {
+                "response": "✅ Pipeline created and scheduled",
+                "pipeline": pipeline
+            }
+
+        return {
+            "response": "✅ Pipeline created",
+            "pipeline": pipeline
+        }
+
+    # =========================
+    # ⚠️ FAST MODE BUT NO JOBS
+    # =========================
+    if parsed and not req.selected_jobs:
+        return {"response": "Please select jobs before creating pipeline"}
 
     # =========================
     # START PIPELINE FLOW
@@ -789,14 +956,16 @@ def chat(req: ChatRequest):
         state["selected_jobs"] = req.selected_jobs
         state["stage"] = "name_pipeline"
 
-        return {"response": "Enter pipeline name"}
+        return {
+            "response": "Enter pipeline name OR use quick format:\nExample: sales pipeline daily 10:00"
+        }
 
     # =========================
     # PIPELINE NAME
     # =========================
     if state.get("stage") == "name_pipeline":
 
-        state["pipeline_name"] = req.message
+        state["pipeline_name"] = message
         state["stage"] = "ask_schedule"
 
         return {"response": "Do you want to schedule it? (yes/no)"}
@@ -819,7 +988,7 @@ def chat(req: ChatRequest):
             state_store[user_id] = {}
 
             return {
-                "response": "Pipeline created successfully",
+                "response": "✅ Pipeline created",
                 "pipeline": pipeline
             }
 
@@ -855,14 +1024,16 @@ def chat(req: ChatRequest):
         return {"response": "Enter time (HH:MM)"}
 
     # =========================
-    # TIME INPUT (🔥 FIXED BLOCK)
+    # TIME INPUT
     # =========================
     if state.get("stage") == "schedule_time":
 
-        try:
-            hour, minute = map(int, message.split(":"))
-        except:
+        import re
+
+        if not re.match(r"^\d{1,2}:\d{2}$", message):
             return {"response": "Invalid time format. Use HH:MM"}
+
+        hour, minute = map(int, message.split(":"))
 
         schedule = state["schedule"]
         schedule["hour"] = hour
@@ -875,21 +1046,19 @@ def chat(req: ChatRequest):
             state["selected_jobs"]
         )
 
-        # SAVE SCHEDULE IN PIPELINE
+        # SAVE SCHEDULE
         pipeline_manager.update_schedule(
             user_id,
             pipeline["pipeline_id"],
             schedule
         )
 
-        # SAVE SCHEDULE IN BLOB
         schedule_service.save_schedule({
             "user_id": user_id,
             "pipeline_id": pipeline["pipeline_id"],
             "schedule": schedule
         })
 
-        # REGISTER SCHEDULER
         schedule_pipeline(
             run_pipeline_execution,
             user_id,
@@ -897,10 +1066,8 @@ def chat(req: ChatRequest):
             schedule
         )
 
-        # RESET STATE
         state_store[user_id] = {}
 
-        # FETCH UPDATED PIPELINE
         pipeline = pipeline_manager.get_pipeline(
             user_id,
             pipeline["pipeline_id"]
@@ -911,8 +1078,11 @@ def chat(req: ChatRequest):
             "pipeline": pipeline
         }
 
+    # =========================
+    # DEFAULT
+    # =========================
     return {"response": "I didn't understand"}
-
+    
 # =========================
 # START UP
 # =========================
