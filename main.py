@@ -1,4 +1,3 @@
-
 from datetime import datetime
 
 from fastapi import FastAPI, HTTPException
@@ -661,19 +660,6 @@ def get_thread(user_id: str, job_id: str):
     try:
         thread = thread_service.get_thread(user_id, job_id)
 
-        # 🔎 derive “latest artifacts” for convenience
-        latest = {
-            "etl": None,
-            "file_upload": None,
-            "automl": None,
-            "powerbi": None
-        }
-
-        for act in thread.get("actions", []):
-            t = act.get("type")
-            if t in latest:
-                latest[t] = act  # last one wins
-
         return {
             "status": "success",
             "thread_id": thread.get("thread_id"),
@@ -682,8 +668,7 @@ def get_thread(user_id: str, job_id: str):
             "created_at": thread.get("created_at"),
             "job_summary": thread.get("job_summary", {}),
             "messages": thread.get("messages", []),
-            "actions": thread.get("actions", []),
-            "latest": latest
+            "actions": thread.get("actions", [])
         }
 
     except Exception as e:
