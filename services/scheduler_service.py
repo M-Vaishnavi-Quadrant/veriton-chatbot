@@ -1,24 +1,36 @@
 from apscheduler.schedulers.background import BackgroundScheduler
 
-class SchedulerService:
+scheduler = BackgroundScheduler()
+scheduler.start()
 
-    def __init__(self):
-        self.scheduler = BackgroundScheduler()
-        self.scheduler.start()
 
-    def schedule_pipeline(self, pipeline_name, user_id, schedule, runner):
+def schedule_pipeline(run_fn, user_id, pipeline_id, schedule):
 
-        def job():
-            print(f"[SCHEDULER] Running: {pipeline_name}")
-            runner(pipeline_name, user_id)
+    if schedule["type"] == "daily":
+        scheduler.add_job(
+            run_fn,
+            "cron",
+            hour=schedule["hour"],
+            minute=schedule["minute"],
+            args=[user_id, pipeline_id]
+        )
 
-        hour, minute = map(int, schedule["time"].split(":"))
+    elif schedule["type"] == "weekly":
+        scheduler.add_job(
+            run_fn,
+            "cron",
+            day_of_week=schedule["day"],
+            hour=schedule["hour"],
+            minute=schedule["minute"],
+            args=[user_id, pipeline_id]
+        )
 
-        if schedule["type"] == "daily":
-            self.scheduler.add_job(job, "cron", hour=hour, minute=minute)
-
-        elif schedule["type"] == "weekly":
-            self.scheduler.add_job(job, "cron", day_of_week="mon", hour=hour, minute=minute)
-
-        elif schedule["type"] == "monthly":
-            self.scheduler.add_job(job, "cron", day=1, hour=hour, minute=minute)
+    elif schedule["type"] == "monthly":
+        scheduler.add_job(
+            run_fn,
+            "cron",
+            day=schedule["day"],
+            hour=schedule["hour"],
+            minute=schedule["minute"],
+            args=[user_id, pipeline_id]
+        )
