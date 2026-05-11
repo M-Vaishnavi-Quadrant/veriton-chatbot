@@ -33,7 +33,7 @@ class ThreadService:
             "job_id": job_id,
             "created_at": datetime.utcnow().isoformat(),
             "messages": [],
-            "actions": [],   # ✅ ONLY SOURCE OF TRUTH
+            "actions": [],
             "job_summary": {
                 "etl_status": "pending",
                 "automl_status": "pending",
@@ -54,11 +54,13 @@ class ThreadService:
         if not blob.exists():
             return self.create_thread(user_id, job_id)
 
-        thread = json.loads(blob.download_blob().readall())
+        try:
+            thread = json.loads(blob.download_blob().readall())
+        except:
+            return self.create_thread(user_id, job_id)
 
-        # 🔥 MIGRATION FIX (remove old "latest")
-        if "latest" in thread:
-            del thread["latest"]
+        # Remove old fields
+        thread.pop("latest", None)
 
         return thread
 
@@ -72,20 +74,37 @@ class ThreadService:
         )
 
     # =========================
-    # ADD ACTION (NO DUPLICATES)
+    # ADD ACTION (ALLOW MULTIPLE RUNS)
     # =========================
     def add_action(self, user_id, job_id, payload):
+
         thread = self.load_thread(user_id, job_id)
 
         action_type = payload.get("type")
 
-        # ❌ PREVENT DUPLICATES
-        if any(a["type"] == action_type for a in thread["actions"]):
-            print(f"⚠️ {action_type} already exists — skipping duplicate")
-            return thread
-
+        # =========================
+        # ADD TIMESTAMP
+        # =========================
         payload["timestamp"] = datetime.utcnow().isoformat()
 
+        # =========================
+        # 🔥 ENSURE job_name ALWAYS EXISTS
+        # =========================
+        if action_type == "etl":
+
+            if not payload.get("job_name"):
+                try:
+                    fact = payload.get("response", {}).get("data_model", {}).get("fact_table")
+                    if fact:
+                        payload["job_name"] = f"{fact}_job"
+                    else:
+                        payload["job_name"] = f"job_{job_id[:6]}"
+                except:
+                    payload["job_name"] = f"job_{job_id[:6]}"
+
+        # =========================
+        # ADD ACTION (NO DUPLICATE BLOCK)
+        # =========================
         thread["actions"].append(payload)
 
         # =========================
@@ -117,26 +136,41 @@ class ThreadService:
     # GET THREAD
     # =========================
     def get_thread(self, user_id, job_id):
+
         thread = self.load_thread(user_id, job_id)
 
-        # 🔥 ADD DOWNLOAD URL FOR ETL
         for action in thread.get("actions", []):
+
             if action.get("type") == "etl":
-                try:
-                    dataset_name = action["response"]["final_dataset"]["dataset_name"]
 
-                    action["download_url"] = f"/download/{user_id}/{job_id}/{dataset_name}"
+                # ✅ Ensure job_name exists (backward compatibility)
+                if not action.get("job_name"):
+                    jid = action.get("job_id")
+                    try:
+                        fact = action.get("response", {}).get("data_model", {}).get("fact_table")
+                        if fact:
+                            action["job_name"] = f"{fact}_job"
+                        elif jid:
+                            action["job_name"] = f"job_{jid[:6]}"
+                    except:
+                        if jid:
+                            action["job_name"] = f"job_{jid[:6]}"
 
-                except:
-                    action["download_url"] = None
+                # ✅ Ensure download_url exists
+                if not action.get("download_url"):
+                    try:
+                        dataset_name = action["response"]["final_dataset"]["dataset_name"]
+                        action["download_url"] = f"/download/{user_id}/{job_id}/{dataset_name}"
+                    except:
+                        action["download_url"] = None
 
-        # 🔥 COMPUTE LATEST
         return thread
 
     # =========================
     # GET ALL THREADS
     # =========================
     def get_threads_by_user(self, user_id):
+
         threads = []
 
         blobs = self.container.list_blobs(name_starts_with=f"{user_id}/")
@@ -149,13 +183,18 @@ class ThreadService:
                     .readall()
                 )
 
-                # 🔥 REMOVE OLD latest FIELD
-                if "latest" in data:
-                    del data["latest"]
+                data.pop("latest", None)
 
-                # 🔥 ADD DOWNLOAD URL
                 for action in data.get("actions", []):
+
                     if action.get("type") == "etl":
+
+                        # job_name fix
+                        if not action.get("job_name"):
+                            jid = action.get("job_id")
+                            action["job_name"] = f"job_{jid[:6]}" if jid else "unknown_job"
+
+                        # download_url fix
                         try:
                             dataset_name = action["response"]["final_dataset"]["dataset_name"]
                             action["download_url"] = f"/download/{user_id}/{data['job_id']}/{dataset_name}"
