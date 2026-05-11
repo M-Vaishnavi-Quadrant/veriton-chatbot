@@ -119,13 +119,18 @@ class ThreadService:
     def get_thread(self, user_id, job_id):
         thread = self.load_thread(user_id, job_id)
 
-        # 🔥 COMPUTE LATEST DYNAMICALLY (NO STORAGE)
-        latest = {}
-        for action in thread["actions"]:
-            latest[action["type"]] = action
+        # 🔥 ADD DOWNLOAD URL FOR ETL
+        for action in thread.get("actions", []):
+            if action.get("type") == "etl":
+                try:
+                    dataset_name = action["response"]["final_dataset"]["dataset_name"]
 
-        thread["latest"] = latest
+                    action["download_url"] = f"/download/{user_id}/{job_id}/{dataset_name}"
 
+                except:
+                    action["download_url"] = None
+
+        # 🔥 COMPUTE LATEST
         return thread
 
     # =========================
@@ -144,16 +149,18 @@ class ThreadService:
                     .readall()
                 )
 
-                # 🔥 REMOVE OLD DUPLICATE FIELD
+                # 🔥 REMOVE OLD latest FIELD
                 if "latest" in data:
                     del data["latest"]
 
-                # 🔥 COMPUTE LATEST
-                latest = {}
+                # 🔥 ADD DOWNLOAD URL
                 for action in data.get("actions", []):
-                    latest[action["type"]] = action
-
-                data["latest"] = latest
+                    if action.get("type") == "etl":
+                        try:
+                            dataset_name = action["response"]["final_dataset"]["dataset_name"]
+                            action["download_url"] = f"/download/{user_id}/{data['job_id']}/{dataset_name}"
+                        except:
+                            action["download_url"] = None
 
                 threads.append(data)
 
