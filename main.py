@@ -957,7 +957,12 @@ def chat(req: ChatRequest):
         state["stage"] = "name_pipeline"
 
         return {
-            "response": "Enter pipeline name OR use quick format:\nExample: sales pipeline daily 10:00"
+            "response": (
+                "Please enter the pipeline name.\n\n"
+                "If you want to schedule it, you can use this format:\n"
+                "Example: sales pipeline daily 10:00\n\n"
+                "If you do NOT want to schedule, simply enter the pipeline name only."
+            )
         }
 
     # =========================
