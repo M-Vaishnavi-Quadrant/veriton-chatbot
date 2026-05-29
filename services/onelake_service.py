@@ -109,77 +109,134 @@ class OneLakeService:
  
         return short_path
  
-    # =========================
-
-    # RENAME FILE (DFS endpoint)
 
     # =========================
+    # RENAME FILE
+    # =========================
 
-    def rename_file(self, user_id, job_id, old_name, new_name):
+    def rename_file(
+
+        self,
+
+        old_path,
+
+        new_path
+    ):
 
         """
-
-        Atomically renames a file in OneLake using ADLS Gen2 DFS rename.
-
-        Filesystem = WorkspaceID, path includes {LakehouseID}.Lakehouse prefix.
-
+        Reliable OneLake rename using:
+        DOWNLOAD -> UPLOAD -> DELETE
         """
- 
-        # ✅ Full DFS paths (workspace-relative)
-
-        old_full_path = f"{self.lakehouse_root}/Files/Datasets/{user_id}/{job_id}/{old_name}"
-
-        new_full_path = f"{self.lakehouse_root}/Files/Datasets/{user_id}/{job_id}/{new_name}"
- 
-        # ✅ Rename destination = {workspace_id}/{new_full_path}
-
-        rename_destination = f"{FABRIC_WORKSPACE_ID}/{new_full_path}"
- 
-        print(f"\n🔁 OneLake DFS Rename")
-
-        print(f"   WORKSPACE  : {FABRIC_WORKSPACE_ID}")
-
-        print(f"   FILESYSTEM : {FABRIC_WORKSPACE_ID}  (workspace, not lakehouse)")
-
-        print(f"   FROM       : {old_full_path}")
-
-        print(f"   TO         : {new_full_path}")
-
-        print(f"   DEST       : {rename_destination}")
- 
-        file_client = self.fs_client.get_file_client(old_full_path)
- 
-        # Verify source exists before attempting rename
 
         try:
 
-            file_client.get_file_properties()
+            print("\n🔁 ONELAKE RENAME STARTED")
 
-            print("✅ Source file confirmed in OneLake")
+            print("OLD PATH:", old_path)
 
-        except ResourceNotFoundError:
+            print("NEW PATH:", new_path)
 
-            print(f"⚠️ Source not found at: {old_full_path}")
+            # ==========================================
+            # OLD FULL PATH
+            # ==========================================
 
-            raise
- 
-        # Attempt rename with retries
+            old_full_path = (
+                f"{self.lakehouse_root}/"
+                f"{old_path}"
+            )
 
-        for attempt in range(3):
+            # ==========================================
+            # DOWNLOAD OLD FILE
+            # ==========================================
 
-            try:
+            old_client = (
+                self.fs_client
+                .get_file_client(
+                    old_full_path
+                )
+            )
 
-                file_client.rename_file(rename_destination)
+            file_data = (
+                old_client
+                .download_file()
+                .readall()
+            )
 
-                print("✅ OneLake rename successful")
+            print(
+                "✅ Downloaded old file"
+            )
 
-                return f"Files/Datasets/{user_id}/{job_id}/{new_name}"
+            # ==========================================
+            # UPLOAD NEW FILE
+            # ==========================================
 
-            except HttpResponseError as e:
+            token = self.get_token()
 
-                print(f"⚠️ Rename attempt {attempt + 1} failed: {e.message}")
+            upload_url = (
 
-                time.sleep(2)
- 
-        raise Exception("OneLake rename failed after 3 attempts")
- 
+                f"https://onelake.blob.fabric.microsoft.com"
+
+                f"/{FABRIC_WORKSPACE_ID}"
+
+                f"/{FABRIC_LAKEHOUSE_ID}"
+
+                f"/{new_path}"
+            )
+
+            headers = {
+
+                "Authorization": (
+                    f"Bearer {token}"
+                ),
+
+                "x-ms-blob-type": "BlockBlob",
+
+                "Content-Type": (
+                    "application/octet-stream"
+                )
+            }
+
+            response = requests.put(
+
+                upload_url,
+
+                headers=headers,
+
+                data=file_data
+            )
+
+            if response.status_code not in [200, 201]:
+
+                raise Exception(
+
+                    f"OneLake upload failed: "
+                    f"{response.text}"
+                )
+
+            print(
+                "✅ Uploaded renamed file"
+            )
+
+            # ==========================================
+            # DELETE OLD FILE
+            # ==========================================
+
+            old_client.delete_file()
+
+            print(
+                "✅ Deleted old file"
+            )
+
+            return new_path
+
+        except Exception as e:
+
+            print(
+                "❌ ONELAKE RENAME FAILED:",
+                str(e)
+            )
+
+            raise Exception(
+                f"OneLake rename failed: {str(e)}"
+            )
+
