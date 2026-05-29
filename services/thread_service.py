@@ -1,6 +1,10 @@
 import json
+import uuid
+
 from datetime import datetime
+
 from azure.storage.blob import BlobServiceClient
+
 from config import BLOB_CONN_STR
 
 THREAD_CONTAINER = "threads"
@@ -9,201 +13,395 @@ THREAD_CONTAINER = "threads"
 class ThreadService:
 
     def __init__(self):
-        self.blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
-        self.container = self.blob_service.get_container_client(THREAD_CONTAINER)
+
+        self.blob_service = (
+            BlobServiceClient
+            .from_connection_string(
+                BLOB_CONN_STR
+            )
+        )
+
+        self.container = (
+            self.blob_service
+            .get_container_client(
+                THREAD_CONTAINER
+            )
+        )
 
         try:
             self.container.create_container()
         except:
             pass
 
-    # =========================
+    # =====================================================
     # PATH
-    # =========================
-    def _path(self, user_id, job_id):
-        return f"{user_id}/{job_id}.json"
+    # =====================================================
 
-    # =========================
+    def _path(
+        self,
+        thread_id
+    ):
+
+        return f"{thread_id}.json"
+
+    # =====================================================
     # CREATE THREAD
-    # =========================
-    def create_thread(self, user_id, job_id):
+    # =====================================================
+
+    def create_thread(
+
+        self,
+
+        user_id,
+
+        job_id,
+
+        title="New Chat"
+    ):
+
+        now = datetime.utcnow().isoformat()
+
         thread = {
-            "thread_id": f"{user_id}_{job_id}",
+
+            "thread_id": (
+                f"thread_{uuid.uuid4().hex}"
+            ),
+
             "user_id": user_id,
+
             "job_id": job_id,
-            "created_at": datetime.utcnow().isoformat(),
+
+            "title": title,
+
+            "created_at": now,
+
+            "updated_at": now,
+
             "messages": [],
+
             "actions": [],
-            "job_summary": {
-                "etl_status": "pending",
-                "automl_status": "pending",
-                "powerbi_status": "pending",
-                "dataset": None
+
+            "context": {
+
+                "uploaded_datasets": [],
+
+                "generated_datasets": [],
+
+                "selected_dataset": None,
+
+                "etl_completed": False,
+
+                "dq_completed": False,
+
+                "dashboard_completed": False,
+
+                "automl_completed": False,
+
+                "ner_completed": False,
+
+                "latest_dataset_path": None,
+
+                "latest_model_id": None,
+
+                "latest_dashboard_id": None,
+
+                "job_saved": False,
+
+                "conversation_state": None
             }
         }
 
-        self.save_thread(user_id, job_id, thread)
-        return thread
+        self.save_thread(thread)
 
-    # =========================
-    # LOAD THREAD
-    # =========================
-    def load_thread(self, user_id, job_id):
-        blob = self.container.get_blob_client(self._path(user_id, job_id))
+        # ==========================================
+        # INITIAL ASSISTANT MESSAGE
+        # ==========================================
 
-        if not blob.exists():
-            return self.create_thread(user_id, job_id)
+        self.add_message(
 
-        try:
-            thread = json.loads(blob.download_blob().readall())
-        except:
-            return self.create_thread(user_id, job_id)
+            thread["thread_id"],
 
-        # Remove old fields
-        thread.pop("latest", None)
+            "assistant",
 
-        return thread
+            "Hello! How can I help you today?"
+        )
 
-    # =========================
+        return self.load_thread(
+            thread["thread_id"]
+        )
+
+    # =====================================================
     # SAVE THREAD
-    # =========================
-    def save_thread(self, user_id, job_id, thread):
-        self.container.get_blob_client(self._path(user_id, job_id)).upload_blob(
-            json.dumps(thread, indent=2),
+    # =====================================================
+
+    def save_thread(
+        self,
+        thread
+    ):
+
+        thread["updated_at"] = (
+            datetime.utcnow().isoformat()
+        )
+
+        blob = self.container.get_blob_client(
+
+            self._path(
+                thread["thread_id"]
+            )
+        )
+
+        blob.upload_blob(
+
+            json.dumps(
+                thread,
+                indent=2
+            ),
+
             overwrite=True
         )
 
-    # =========================
-    # ADD ACTION (ALLOW MULTIPLE RUNS)
-    # =========================
-    def add_action(self, user_id, job_id, payload):
+    # =====================================================
+    # LOAD THREAD
+    # =====================================================
 
-        thread = self.load_thread(user_id, job_id)
+    def load_thread(
+        self,
+        thread_id
+    ):
 
-        action_type = payload.get("type")
+        blob = self.container.get_blob_client(
 
-        # =========================
-        # ADD TIMESTAMP
-        # =========================
-        payload["timestamp"] = datetime.utcnow().isoformat()
+            self._path(thread_id)
+        )
 
-        # =========================
-        # 🔥 ENSURE job_name ALWAYS EXISTS
-        # =========================
-        if action_type == "etl":
+        if not blob.exists():
 
-            if not payload.get("job_name"):
-                try:
-                    fact = payload.get("response", {}).get("data_model", {}).get("fact_table")
-                    if fact:
-                        payload["job_name"] = f"{fact}_job"
-                    else:
-                        payload["job_name"] = f"job_{job_id[:6]}"
-                except:
-                    payload["job_name"] = f"job_{job_id[:6]}"
+            return None
 
-        # =========================
-        # ADD ACTION (NO DUPLICATE BLOCK)
-        # =========================
-        thread["actions"].append(payload)
+        return json.loads(
 
-        # =========================
-        # UPDATE STATUS
-        # =========================
-        if action_type == "etl":
-            thread["job_summary"]["etl_status"] = "completed"
+            blob.download_blob().readall()
+        )
 
-            try:
-                dataset_name = payload["response"]["final_dataset"]["dataset_name"]
-                thread["job_summary"]["dataset"] = dataset_name
-            except:
-                pass
+    # =====================================================
+    # LIST THREADS
+    # =====================================================
 
-        elif action_type == "automl":
-            thread["job_summary"]["automl_status"] = "completed"
-
-        elif action_type == "powerbi":
-            thread["job_summary"]["powerbi_status"] = "completed"
-
-        elif action_type == "file_upload":
-            thread["job_summary"]["file_uploaded"] = True
-
-        self.save_thread(user_id, job_id, thread)
-
-        return thread
-
-    # =========================
-    # GET THREAD
-    # =========================
-    def get_thread(self, user_id, job_id):
-
-        thread = self.load_thread(user_id, job_id)
-
-        for action in thread.get("actions", []):
-
-            if action.get("type") == "etl":
-
-                # ✅ Ensure job_name exists (backward compatibility)
-                if not action.get("job_name"):
-                    jid = action.get("job_id")
-                    try:
-                        fact = action.get("response", {}).get("data_model", {}).get("fact_table")
-                        if fact:
-                            action["job_name"] = f"{fact}_job"
-                        elif jid:
-                            action["job_name"] = f"job_{jid[:6]}"
-                    except:
-                        if jid:
-                            action["job_name"] = f"job_{jid[:6]}"
-
-                # ✅ Ensure download_url exists
-                if not action.get("download_url"):
-                    try:
-                        dataset_name = action["response"]["final_dataset"]["dataset_name"]
-                        action["download_url"] = f"/download/{user_id}/{job_id}/{dataset_name}"
-                    except:
-                        action["download_url"] = None
-
-        return thread
-
-    # =========================
-    # GET ALL THREADS
-    # =========================
-    def get_threads_by_user(self, user_id):
+    def list_threads(
+        self,
+        user_id,
+        job_id
+    ):
 
         threads = []
 
-        blobs = self.container.list_blobs(name_starts_with=f"{user_id}/")
+        blobs = self.container.list_blobs()
 
         for blob in blobs:
+
             try:
-                data = json.loads(
-                    self.container.get_blob_client(blob.name)
+
+                raw = (
+                    self.container
+                    .get_blob_client(blob.name)
                     .download_blob()
                     .readall()
                 )
 
-                data.pop("latest", None)
+                data = json.loads(raw)
 
-                for action in data.get("actions", []):
+                if (
+                    data["user_id"] == user_id
+                    and
+                    data["job_id"] == job_id
+                ):
 
-                    if action.get("type") == "etl":
+                    threads.append({
 
-                        # job_name fix
-                        if not action.get("job_name"):
-                            jid = action.get("job_id")
-                            action["job_name"] = f"job_{jid[:6]}" if jid else "unknown_job"
+                        "thread_id": (
+                            data["thread_id"]
+                        ),
 
-                        # download_url fix
-                        try:
-                            dataset_name = action["response"]["final_dataset"]["dataset_name"]
-                            action["download_url"] = f"/download/{user_id}/{data['job_id']}/{dataset_name}"
-                        except:
-                            action["download_url"] = None
+                        "title": (
+                            data["title"]
+                        ),
 
-                threads.append(data)
+                        "updated_at": (
+                            data["updated_at"]
+                        ),
+
+                        "created_at": (
+                            data["created_at"]
+                        )
+                    })
 
             except:
                 continue
 
+        threads.sort(
+
+            key=lambda x: x["updated_at"],
+
+            reverse=True
+        )
+
         return threads
+
+    # =====================================================
+    # ADD MESSAGE
+    # =====================================================
+
+    def add_message(
+
+        self,
+
+        thread_id,
+
+        role,
+
+        content,
+
+        message_type="text",
+
+        metadata=None
+    ):
+
+        thread = self.load_thread(
+            thread_id
+        )
+
+        if not thread:
+
+            raise Exception(
+                "Thread not found"
+            )
+
+        thread["messages"].append({
+
+            "message_id": (
+                str(uuid.uuid4())
+            ),
+
+            "role": role,
+
+            "message_type": message_type,
+
+            "content": content,
+
+            "metadata": metadata or {},
+
+            "timestamp": (
+                datetime.utcnow()
+                .isoformat()
+            )
+        })
+
+        self.save_thread(thread)
+
+        return thread
+
+    # =====================================================
+    # ADD ACTION
+    # =====================================================
+
+    def add_action(
+
+        self,
+
+        thread_id,
+
+        action
+    ):
+
+        thread = self.load_thread(
+            thread_id
+        )
+
+        if not thread:
+
+            raise Exception(
+                "Thread not found"
+            )
+
+        action["action_id"] = (
+            str(uuid.uuid4())
+        )
+
+        action["timestamp"] = (
+            datetime.utcnow()
+            .isoformat()
+        )
+
+        thread["actions"].append(
+            action
+        )
+
+        self.save_thread(thread)
+
+        return action
+
+    # =====================================================
+    # UPDATE CONTEXT
+    # =====================================================
+
+    def update_context(
+
+        self,
+
+        thread_id,
+
+        updates
+    ):
+
+        thread = self.load_thread(
+            thread_id
+        )
+
+        if not thread:
+
+            raise Exception(
+                "Thread not found"
+            )
+
+        thread["context"].update(
+            updates
+        )
+
+        self.save_thread(thread)
+
+        return thread["context"]
+
+    # =====================================================
+    # ATTACH DATASET
+    # =====================================================
+
+    def attach_dataset(
+
+        self,
+
+        thread_id,
+
+        dataset
+    ):
+
+        thread = self.load_thread(
+            thread_id
+        )
+
+        if not thread:
+
+            raise Exception(
+                "Thread not found"
+            )
+
+        thread["context"][
+            "uploaded_datasets"
+        ].append(dataset)
+
+        thread["context"][
+            "selected_dataset"
+        ] = dataset
+
+        self.save_thread(thread)
+
+        return dataset
