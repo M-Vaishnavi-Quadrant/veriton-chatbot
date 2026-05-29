@@ -1,13 +1,19 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()   # 👈 THIS IS THE MISSING PIECE
+load_dotenv()  
 
 # Storage
 STORAGE_ACCOUNT_NAME = os.getenv("STORAGE_ACCOUNT_NAME")
 STORAGE_ACCOUNT_KEY = os.getenv("STORAGE_ACCOUNT_KEY")
 V_CONNECTION_STRING = os.getenv("V_CONNECTION_STRING")
+V_STORAGE_ACCOUNT_KEY = os.getenv("V_STORAGE_ACCOUNT_KEY")
+V_STORAGE_ACCOUNT_NAME = os.getenv("V_STORAGE_ACCOUNT_NAME")
 
+AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
 
 BLOB_CONN_STR = (
     f"DefaultEndpointsProtocol=https;"
@@ -19,7 +25,8 @@ BLOB_CONN_STR = (
 AI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AI_API_KEY  = os.getenv("AZURE_OPENAI_API_KEY")
 AI_MODEL    = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
-
+COSMOS_URL = os.getenv("COSMOS_URL")
+COSMOS_KEY= os.getenv("COSMOS_KEY")
 # Containers
 DATA_INGESTION_CONTAINER = "dataingestionfiles"
 USER_CONTAINER = "userdata"
