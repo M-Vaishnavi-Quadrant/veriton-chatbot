@@ -54,6 +54,50 @@ class UploadService:
             ThreadService()
         )
 
+    def detect_header_row(
+            self,
+            df
+        ):
+
+            best_row = 0
+            best_score = -999
+
+            for idx in range(min(10, len(df))):
+
+                row = df.iloc[idx]
+
+                values = [
+
+                    str(x).strip()
+
+                    for x in row
+
+                    if pd.notna(x)
+                ]
+
+                score = 0
+
+                score += len(values)
+
+                score += len(set(values))
+
+                score -= sum(
+
+                    1
+
+                    for v in values
+
+                    if "unnamed" in v.lower()
+                )
+
+                if score > best_score:
+
+                    best_score = score
+
+                    best_row = idx
+
+            return best_row
+
     # =====================================================
     # AUTOML REGISTRATION
     # =====================================================
@@ -136,7 +180,9 @@ class UploadService:
 
         file_name,
 
-        contents
+        contents,
+
+        sheet_name=None
     ):
 
         file_name = file_name.lower()
@@ -158,8 +204,55 @@ class UploadService:
             file_name.endswith(".xls")
         ):
 
-            return pd.read_excel(
+            excel_file = pd.ExcelFile(
                 BytesIO(contents)
+            )
+
+            sheets = excel_file.sheet_names
+
+            selected_sheet = (
+
+                sheet_name
+
+                if sheet_name
+
+                else sheets[0]
+            )
+
+            print(
+                f"📌 Selected Sheet: "
+                f"{selected_sheet}"
+            )
+
+            # ===============================
+            # DETECT HEADER ROW
+            # ===============================
+
+            raw_df = pd.read_excel(
+
+                BytesIO(contents),
+
+                sheet_name=selected_sheet,
+
+                header=None
+            )
+
+            header_row = self.detect_header_row(
+                raw_df
+            )
+
+            print(
+                f"📌 Header Row: "
+                f"{header_row}"
+            )
+
+            return pd.read_excel(
+
+                BytesIO(contents),
+
+                sheet_name=selected_sheet,
+
+                header=header_row
             )
 
         # PARQUET
@@ -224,7 +317,8 @@ class UploadService:
 
         user_email,
 
-        file
+        file,
+        sheet_name=None
     ):
 
         # ==========================================
@@ -247,12 +341,58 @@ class UploadService:
 
         contents = await file.read()
 
+        # =====================================
+        # EXCEL SHEET DETECTION
+        # =====================================
+
+        if file.filename.lower().endswith(
+            (".xlsx", ".xls")
+        ):
+
+            excel_file = pd.ExcelFile(
+                BytesIO(contents)
+            )
+
+            sheets = excel_file.sheet_names
+
+            print(
+                f"📄 Available Sheets: {sheets}"
+            )
+
+            # Ask user to select sheet
+
+            if len(sheets) > 1 and not sheet_name:
+
+                return {
+
+                    "success": False,
+
+                    "status":
+                        "sheet_selection_required",
+
+                    "job_id":
+                        job_id,
+
+                    "thread_id":
+                        thread_id,
+
+                    "file_name":
+                        file.filename,
+
+                    "sheets":
+                        sheets
+                }
+
         df = self.read_dataset(
 
             file.filename,
 
-            contents
+            contents,
+
+            sheet_name
         )
+        
+        selected_sheet = sheet_name
 
         # ==========================================
         # CONVERT TO CSV
@@ -476,7 +616,10 @@ class UploadService:
 
                 "column_names": (
                     list(df.columns)
-                )
+                ),
+
+                "sheet_name":
+                    selected_sheet
             },
 
             # ======================================
