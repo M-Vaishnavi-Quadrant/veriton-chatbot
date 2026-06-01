@@ -250,6 +250,136 @@ class CosmosService:
         )
 
         return jobs
+    
+    def list_jobs_for_pipeline(
+        self,
+        user_id
+    ):
+
+        jobs = self.list_jobs(
+            user_id
+        )
+
+        result = []
+
+        for job in jobs:
+
+            # ==========================
+            # ONLY JOBS WITH SCHEDULE
+            # ==========================
+
+            schedule = job.get(
+                "schedule"
+            )
+
+            if not schedule:
+                continue
+
+            result.append({
+
+                "job_id":
+                    job.get("job_id"),
+
+                "job_name":
+                    job.get("job_name"),
+
+                "dataset_name":
+                    job.get("dataset_name"),
+
+                "dataset_path":
+                    job.get("dataset_path"),
+
+                "onelake_path":
+                    job.get("onelake_path"),
+
+                "schedule": {
+
+                    "frequency":
+                        schedule.get(
+                            "frequency"
+                        ),
+
+                    "time_utc":
+                        schedule.get(
+                            "time_utc"
+                        ),
+
+                    "scheduled_at":
+                        schedule.get(
+                            "scheduled_at"
+                        ),
+
+                    "active":
+                        schedule.get(
+                            "active",
+                            False
+                        )
+                },
+
+                "actions": {
+
+                    "etl": True,
+
+                    "dq":
+                        job.get(
+                            "dq",
+                            False
+                        ),
+
+                    "ner":
+                        job.get(
+                            "ner",
+                            False
+                        ),
+
+                    "business_logic":
+                        job.get(
+                            "business_logic",
+                            False
+                        ),
+
+                    "dashboard":
+                        job.get(
+                            "dashboard",
+                            False
+                        ),
+
+                    "automl":
+                        job.get(
+                            "automl",
+                            False
+                        )
+                }
+            })
+
+        return result
+    
+    def save_pipeline(
+        self,
+        user_id,
+        pipeline_doc
+    ):
+
+        doc = self.get_user_document(
+            user_id
+        )
+
+        pipelines = doc.get(
+            "pipelines",
+            []
+        )
+
+        pipelines.append(
+            pipeline_doc
+        )
+
+        doc["pipelines"] = pipelines
+
+        self.container.upsert_item(
+            doc
+        )
+
+        return pipeline_doc
 
     # =====================================================
     # DELETE JOB
