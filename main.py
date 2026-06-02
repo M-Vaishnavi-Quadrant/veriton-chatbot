@@ -657,29 +657,13 @@ def run(req: RunRequest):
         )
 
         # ==========================================
-        # ASSISTANT MESSAGE
-        # ==========================================
-
-        assistant_message = (
-            "✅ Dataset generated successfully.\n\n"
-            "Available Actions:\n"
-            "- Download Dataset\n"
-            "- Save Job\n"
-            "- Apply DQ Rules\n"
-            "- Apply Business Logic\n"
-            "- Run NER\n"
-            "- Generate Dashboard\n"
-            "- Build AutoML Model"
-        )
-
-        # ==========================================
         # ADD COMPLETION MESSAGE
         # ==========================================
 
         thread_service.add_message(
             thread_id=req.thread_id,
             role="assistant",
-            content=assistant_message,
+            content="Starting ETL pipeline",
             message_type="completion",
             metadata={
                 "download_url": download_url,
@@ -697,17 +681,48 @@ def run(req: RunRequest):
         # ==========================================
 
         thread_service.add_action(
+
             req.thread_id,
+
             {
-                "type": "etl_complete",
+
+                "type": "etl",
+
                 "status": "completed",
-                "dataset_name": (
-                    dataset_display_name
-                ),
-                "dataset_path": (
-                    dataset_path
-                ),
-            },
+
+                "job_id": req.job_id,
+
+                "job_name": job_name,
+
+                "prompt": req.prompt,
+
+                "dataset_name": dataset_display_name,
+
+                "dataset_path": dataset_path,
+
+                "download_url": download_url,
+
+                "response": {
+
+                    "data_model":
+                        result.get(
+                            "data_model"
+                        ),
+
+                    "relationships":
+                        result.get(
+                            "relationships"
+                        ),
+
+                    "schemas":
+                        result.get(
+                            "schemas"
+                        ),
+
+                    "final_dataset":
+                        final_dataset
+                }
+            }
         )
 
         # ==========================================
@@ -736,13 +751,7 @@ def run(req: RunRequest):
 
             "saved": False,
 
-            "message": assistant_message,
-
             "next_actions": [
-                {
-                    "action": "save_job",
-                    "label": "Save Job"
-                },
                 {
                     "action": "dq",
                     "label": "Apply Data Quality Rules"
@@ -753,7 +762,7 @@ def run(req: RunRequest):
                 },
                 {
                     "action": "ner",
-                    "label": "Apply Name Entity Resolutiob"
+                    "label": "Apply Name Entity Resolution"
                 },
                 {
                     "action": "dashboard",
@@ -2024,7 +2033,9 @@ def get_job_details(
 # =========================
 
 @app.post("/generate_powerbi_dashboard")
-def generate_dashboard(req: PowerBIDashboardRequest):
+def generate_dashboard(
+    req: PowerBIDashboardRequest
+):
 
     try:
 
@@ -2044,84 +2055,43 @@ def generate_dashboard(req: PowerBIDashboardRequest):
         )
 
         # =====================================
-        # SAVE ACTION
+        # SAVE POWERBI ACTION
         # =====================================
 
         try:
 
             thread_service.add_action(
 
-                req.user_id,
-
-                req.job_id,
+                req.thread_id,
 
                 {
 
                     "type": "powerbi",
 
-                    "prompt": req.user_prompt,
+                    "status": "completed",
 
-                    "response": clean_result,
+                    "job_id":
+                        req.job_id,
+
+                    "user_id":
+                        req.user_id,
+
+                    "prompt":
+                        req.user_prompt,
+
+                    "response":
+                        clean_result
                 }
+            )
+
+            print(
+                "✅ PowerBI action saved"
             )
 
         except Exception as e:
 
             print(
-                "⚠️ Action save failed:",
-                str(e)
-            )
-
-        # =====================================
-        # SAVE USER MESSAGE
-        # =====================================
-
-        try:
-
-            thread_service.add_message(
-
-                thread_id=req.thread_id,
-
-                role="user",
-
-                content=req.user_prompt,
-
-                message_type="query",
-
-                metadata={
-
-                    "action":
-                        "dashboard"
-                }
-            )
-
-            # =================================
-            # SAVE ASSISTANT RESPONSE
-            # =================================
-
-            thread_service.add_message(
-
-                thread_id=req.thread_id,
-
-                role="assistant",
-
-                content=(
-                    "Power BI dashboard generated successfully."
-                ),
-
-                message_type="completion",
-
-                metadata=clean_result
-            )
-
-            print(
-                "✅ Thread messages saved"
-            )
-
-        except Exception as e:
-
-            print(
-                "⚠️ Thread save failed:",
+                "⚠️ PowerBI action save failed:",
                 str(e)
             )
 
@@ -2138,10 +2108,7 @@ def generate_dashboard(req: PowerBIDashboardRequest):
                 {
 
                     "dashboard_completed":
-                        True,
-
-                    "latest_dashboard":
-                        clean_result
+                        True
                 }
             )
 
@@ -2181,6 +2148,11 @@ def generate_dashboard(req: PowerBIDashboardRequest):
                     req.thread_id
                 )
 
+                job_doc["updated_at"] = (
+                    datetime.utcnow().isoformat()
+                    + "Z"
+                )
+
                 cosmos_service.update_dataset(
 
                     req.user_id,
@@ -2204,6 +2176,7 @@ def generate_dashboard(req: PowerBIDashboardRequest):
         # =====================================
 
         return JSONResponse(
+
             content=clean_result
         )
 
@@ -2220,7 +2193,6 @@ def generate_dashboard(req: PowerBIDashboardRequest):
 
             detail=str(e)
         )
-
 
 # =========================
 # AUTOML RUN
@@ -3405,26 +3377,50 @@ def add_job_to_pipeline(user_id: str, pipeline_id: str, job_id: str):
 # UPLOAD DATASET (with job_id)
 # =========================
 
+from typing import Optional
+
 @app.post("/datasets/upload")
 async def upload_dataset(
+
     user_id: str = Form(...),
+
     job_id: str = Form(...),
+
     session_id: str = Form(...),
+
     user_email: str = Form(...),
+
     thread_id: str = Form(...),
+
     file: UploadFile = File(...),
+
+    sheet_name: Optional[str] = Form(None)
 ):
     try:
+
         return await upload_service.upload_dataset(
+
             user_id=user_id,
+
             job_id=job_id,
+
             thread_id=thread_id,
+
             session_id=session_id,
+
             user_email=user_email,
+
             file=file,
+
+            sheet_name=sheet_name
         )
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
 # =========================
