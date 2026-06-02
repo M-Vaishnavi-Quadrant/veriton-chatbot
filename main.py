@@ -18,6 +18,7 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from openai import AzureOpenAI
 from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
 
 from config import (
     AZURE_OPENAI_API_KEY,
@@ -107,12 +108,14 @@ class SaveJobRequest(BaseModel):
 class RenameJobRequest(BaseModel):
     user_id: str
     job_id: str
+    thread_id: str
     new_name: str
 
 
 class RenameDatasetRequest(BaseModel):
     user_id: str
     job_id: str
+    thread_id: str
     new_name: str
 
 
@@ -121,6 +124,7 @@ class PowerBIDashboardRequest(BaseModel):
     user_prompt: str
     user_id: str
     job_id: str
+    thread_id: str
 
 
 class AutoMLRequest(BaseModel):
@@ -129,6 +133,7 @@ class AutoMLRequest(BaseModel):
     session_id: str
     user_email: str
     query: str
+    thread_id: str
 
 
 class DQRuleRequest(BaseModel):
@@ -150,9 +155,9 @@ class ChatRequest(BaseModel):
     user_id: str
     job_id: str
     thread_id: str
-    session_id: str
     user_email: str
     message: str
+    selected_jobs: Optional[List[str]] = None
 
 
 class AttachDatasetRequest(BaseModel):
@@ -166,6 +171,13 @@ class AttachDatasetRequest(BaseModel):
 
 def generate_job_id() -> str:
     return uuid.uuid4().hex
+
+def generate_pipeline_id():
+
+    return (
+        "pipe_"
+        + uuid.uuid4().hex[:24]
+    )
 
 
 def extract_pipeline_name(message: str) -> str:
@@ -334,7 +346,7 @@ def generate_job_name(name: str):
 
 def generate_dataset_name(job_name: str):
 
-    return f"{job_name}"
+    return f"{job_name}_dataset"
 
 
 def generate_dataset_file(job_name: str):
@@ -478,29 +490,34 @@ def run(req: RunRequest):
         if dataset_df is None:
             raise Exception("Pipeline did not return dataframe")
 
-        # ==========================================
-        # DATASET NAME
-        # ==========================================
-
-        original_dataset_name = (
-            final_dataset.get("dataset_name")
-            or f"{req.job_id}_dataset.csv"
-        )
-
-        base_name = original_dataset_name.split(".")[0]
 
         # ==========================================
         # JOB NAME
         # ==========================================
 
-        job_name = (
+        original_dataset_name = (
+            final_dataset.get("dataset_name")
+            or f"{req.job_id}.csv"
+        )
 
+        base_name = (
+            original_dataset_name
+            .replace(".csv", "")
+        )
+
+        # Remove _dataset suffix if present
+        if base_name.endswith("_dataset"):
+            base_name = base_name[:-8]
+
+        job_name = (
             base_name
             .replace(" ", "_")
             .replace("-", "_")
             .lower()
             .strip()
         )
+
+        print(f"📌 Job Name: {job_name}")
 
         # ==========================================
         # DATASET DISPLAY NAME
@@ -798,48 +815,92 @@ def download_dataset(
 
     try:
 
-        blob_path = (
+        # ==========================================
+        # BUILD BLOB PATH
+        # ==========================================
 
+        blob_path = (
             f"{user_id}/"
             f"{job_id}/"
             f"{file_name}"
         )
 
-        blob_client = (
-            blob_service
-            .get_blob_client(
-
-                container=V_DATASET_CONTAINER,
-
-                blob=blob_path
-            )
+        print(
+            f"📥 Download requested: {blob_path}"
         )
+
+        # ==========================================
+        # GET BLOB CLIENT
+        # ==========================================
+
+        blob_client = blob_service.get_blob_client(
+
+            container=V_DATASET_CONTAINER,
+
+            blob=blob_path
+        )
+
+        # ==========================================
+        # VALIDATE FILE EXISTS
+        # ==========================================
 
         if not blob_client.exists():
 
             raise HTTPException(
+
                 status_code=404,
-                detail="File not found"
+
+                detail=(
+                    f"Dataset not found: "
+                    f"{blob_path}"
+                )
             )
 
+        # ==========================================
+        # DOWNLOAD STREAM
+        # ==========================================
+
         stream = blob_client.download_blob()
+
+        print(
+            f"✅ Downloading: {file_name}"
+        )
+
+        # ==========================================
+        # RETURN FILE
+        # ==========================================
 
         return StreamingResponse(
 
             stream.chunks(),
 
-            media_type="text/csv",
+            media_type="application/octet-stream",
 
             headers={
+
                 "Content-Disposition":
-                f"attachment; filename={file_name}"
+                    f'attachment; filename="{file_name}"',
+
+                "Cache-Control":
+                    "no-cache"
             }
         )
 
+    except HTTPException:
+
+        raise
+
     except Exception as e:
 
+        print(
+            "❌ DOWNLOAD ERROR:",
+            str(e)
+        )
+
         raise HTTPException(
+
             status_code=500,
+
             detail=str(e)
         )
 
@@ -874,8 +935,19 @@ def save_job(req: SaveJobRequest):
         context = thread["context"]
 
         job_name = context.get(
-            "job_name"
+                "job_name",
+                ""
+            )
+
+        # normalize job name
+        job_name = (
+            job_name
+            .replace(".csv", "")
+            .strip()
         )
+
+        while job_name.endswith("_dataset"):
+            job_name = job_name[:-8]
 
         dataset = context.get(
             "selected_dataset"
@@ -1429,6 +1501,7 @@ def save_job(req: SaveJobRequest):
 # =========================================================
 # RENAME JOB
 # =========================================================
+
 @app.post("/rename-job")
 def rename_job(req: RenameJobRequest):
 
@@ -1436,33 +1509,135 @@ def rename_job(req: RenameJobRequest):
 
         print("\n🔁 RENAME JOB STARTED")
 
-        # ==========================================
-        # LOAD JOB
-        # ==========================================
-
         job = cosmos_service.get_dataset(
-
             req.user_id,
-
             req.job_id
         )
 
         if not job:
 
             raise HTTPException(
-
                 status_code=404,
+                detail="Job not found"
+            )
 
+        old_job_name = job.get(
+            "job_name",
+            ""
+        )
+
+        new_job_name = (
+            req.new_name
+            .replace(" ", "_")
+            .replace("-", "_")
+            .lower()
+            .strip()
+        )
+
+        # ==================================
+        # UPDATE COSMOS
+        # ==================================
+
+        job["job_name"] = new_job_name
+        job["thread_id"] = req.thread_id
+
+        job["updated_at"] = (
+            datetime.utcnow().isoformat()
+            + "Z"
+        )
+
+        cosmos_service.update_dataset(
+            req.user_id,
+            job
+        )
+
+        print("✅ Cosmos updated")
+
+        # ==================================
+        # UPDATE THREAD
+        # ==================================
+
+        if req.thread_id:
+
+            thread_service.update_context(
+
+                req.thread_id,
+
+                {
+                    "job_name": new_job_name
+                }
+            )
+
+            thread_service.add_message(
+
+                thread_id=req.thread_id,
+
+                role="assistant",
+
+                content=(
+                    f"Job renamed successfully.\n\n"
+                    f"Old Name: {old_job_name}\n"
+                    f"New Name: {new_job_name}"
+                ),
+
+                message_type="completion"
+            )
+
+            print("✅ Thread updated")
+
+        return {
+
+            "status": "success",
+
+            "message": "Job renamed successfully",
+
+            "job_id": req.job_id,
+
+            "thread_id": req.thread_id,
+
+            "old_job_name": old_job_name,
+
+            "new_job_name": new_job_name
+        }
+
+    except Exception as e:
+
+        print(
+            "❌ RENAME JOB ERROR:",
+            str(e)
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+@app.post("/rename-dataset")
+def rename_dataset(req: RenameDatasetRequest):
+
+    try:
+
+        print("\n🔁 RENAME DATASET STARTED")
+
+        # ==========================================
+        # LOAD JOB
+        # ==========================================
+
+        job = cosmos_service.get_dataset(
+            req.user_id,
+            req.job_id
+        )
+
+        if not job:
+
+            raise HTTPException(
+                status_code=404,
                 detail="Job not found"
             )
 
         # ==========================================
         # OLD VALUES
         # ==========================================
-
-        old_job_name = job.get(
-            "job_name"
-        )
 
         old_dataset_name = job.get(
             "dataset_name"
@@ -1476,12 +1651,18 @@ def rename_job(req: RenameJobRequest):
             "onelake_path"
         )
 
+        print("\n========== DEBUG ==========")
+        print("Job ID:", req.job_id)
+        print("Dataset Name:", old_dataset_name)
+        print("Dataset Path:", old_dataset_path)
+        print("OneLake Path:", old_onelake_path)
+        print("===========================\n")
+
         # ==========================================
-        # NEW JOB NAME
+        # NEW DATASET NAME
         # ==========================================
 
-        new_job_name = (
-
+        base_name = (
             req.new_name
             .replace(" ", "_")
             .replace("-", "_")
@@ -1489,40 +1670,52 @@ def rename_job(req: RenameJobRequest):
             .strip()
         )
 
-        # ==========================================
-        # NEW DATASET FILE
-        # ==========================================
+        while base_name.endswith("_dataset"):
+            base_name = base_name[:-8]
 
         new_dataset_name = (
-            f"{new_job_name}_dataset.csv"
+            f"{base_name}_dataset"
         )
+
+        new_dataset_file = (
+            f"{new_dataset_name}.csv"
+        )
+
+        # ==========================================
+        # NEW BLOB PATH
+        # ==========================================
 
         new_dataset_path = (
-
             f"{req.user_id}/"
             f"{req.job_id}/"
-            f"{new_dataset_name}"
-        )
-
-        new_onelake_path = (
-
-            f"Files/Datasets/"
-            f"{req.user_id}/"
-            f"{req.job_id}/"
-            f"{new_dataset_name}"
+            f"{new_dataset_file}"
         )
 
         # ==========================================
-        # RENAME BLOB
+        # BLOB CONTAINER
         # ==========================================
 
-        container = (
+        container = blob_service.get_container_client(
+            V_DATASET_CONTAINER
+        )
 
-            blob_service
-            .get_container_client(
-                V_DATASET_CONTAINER
+        print("\n📂 BLOBS FOUND:")
+
+        blobs = list(
+            container.list_blobs(
+                name_starts_with=(
+                    f"{req.user_id}/"
+                    f"{req.job_id}/"
+                )
             )
         )
+
+        for b in blobs:
+            print(b.name)
+
+        # ==========================================
+        # FALLBACK IF COSMOS PATH WRONG
+        # ==========================================
 
         old_blob = container.get_blob_client(
             old_dataset_path
@@ -1530,12 +1723,37 @@ def rename_job(req: RenameJobRequest):
 
         if not old_blob.exists():
 
-            raise HTTPException(
-
-                status_code=404,
-
-                detail="Dataset blob not found"
+            print(
+                "⚠️ Cosmos dataset_path incorrect"
             )
+
+            if not blobs:
+
+                raise HTTPException(
+                    status_code=404,
+                    detail="No dataset blob found"
+                )
+
+            actual_blob_path = blobs[0].name
+
+            print(
+                "✅ Using actual blob:",
+                actual_blob_path
+            )
+
+            old_dataset_path = (
+                actual_blob_path
+            )
+
+            old_blob = (
+                container.get_blob_client(
+                    actual_blob_path
+                )
+            )
+
+        # ==========================================
+        # RENAME BLOB
+        # ==========================================
 
         new_blob = container.get_blob_client(
             new_dataset_path
@@ -1550,8 +1768,7 @@ def rename_job(req: RenameJobRequest):
         while props.copy.status == "pending":
 
             props = (
-                new_blob
-                .get_blob_properties()
+                new_blob.get_blob_properties()
             )
 
         if props.copy.status != "success":
@@ -1559,337 +1776,6 @@ def rename_job(req: RenameJobRequest):
             raise Exception(
                 "Blob rename failed"
             )
-
-        old_blob.delete_blob()
-
-        print("✅ Blob renamed")
-
-        # ==========================================
-        # RENAME ONELAKE
-        # ==========================================
-
-        upload_service.onelake_service.rename_file(
-
-            old_path=old_onelake_path,
-
-            new_path=new_onelake_path
-        )
-
-        print("✅ OneLake renamed")
-
-        # ==========================================
-        # UPDATE COSMOS
-        # ==========================================
-
-        job["job_name"] = (
-            new_job_name
-        )
-
-        job["dataset_name"] = (
-            new_dataset_name
-        )
-
-        job["dataset_path"] = (
-            new_dataset_path
-        )
-
-        job["onelake_path"] = (
-            new_onelake_path
-        )
-
-        job["updated_at"] = (
-
-            datetime.utcnow()
-            .isoformat()
-
-            + "Z"
-        )
-
-        cosmos_service.update_dataset(
-
-            req.user_id,
-
-            job
-        )
-
-        print("✅ Cosmos updated")
-
-        # ==========================================
-        # UPDATE CREATED DATASETS
-        # ==========================================
-
-        cosmos_service.rename_created_dataset(
-
-            user_id=req.user_id,
-
-            job_id=req.job_id,
-
-            new_dataset_name=(
-                new_dataset_name
-            ),
-
-            new_dataset_path=(
-                new_dataset_path
-            ),
-
-            new_onelake_path=(
-                new_onelake_path
-            )
-        )
-
-        print(
-            "✅ Created datasets updated"
-        )
-
-        # ==========================================
-        # UPDATE THREAD
-        # ==========================================
-
-        thread_id = job.get(
-            "thread_id"
-        )
-
-        if thread_id:
-
-            thread_service.update_context(
-
-                thread_id,
-
-                {
-
-                    "job_name": (
-                        new_job_name
-                    ),
-
-                    "latest_dataset_path": (
-                        new_dataset_path
-                    ),
-
-                    "selected_dataset": {
-
-                        "dataset_name": (
-                            new_dataset_name
-                        ),
-
-                        "blob_path": (
-                            new_dataset_path
-                        ),
-
-                        "onelake_path": (
-                            new_onelake_path
-                        )
-                    }
-                }
-            )
-
-        print("✅ Thread updated")
-
-        return {
-
-            "status": "success",
-
-            "message": (
-                "Job renamed successfully"
-            ),
-
-            "old_job_name": (
-                old_job_name
-            ),
-
-            "new_job_name": (
-                new_job_name
-            ),
-
-            "dataset_name": (
-                new_dataset_name
-            ),
-
-            "blob_path": (
-                new_dataset_path
-            ),
-
-            "onelake_path": (
-                new_onelake_path
-            )
-        }
-
-    except Exception as e:
-
-        print(
-            "❌ RENAME JOB ERROR:",
-            str(e)
-        )
-
-        raise HTTPException(
-
-            status_code=500,
-
-            detail=str(e)
-        )
-
-
-# =========================================================
-# RENAME DATASET
-# =========================================================
-
-
-
-@app.post("/rename-dataset")
-def rename_dataset(req: RenameDatasetRequest):
-
-    try:
-
-        print("\n🔁 RENAME DATASET STARTED")
-
-        # ==========================================
-        # LOAD JOB
-        # ==========================================
-
-        job = cosmos_service.get_dataset(
-
-            req.user_id,
-
-            req.job_id
-        )
-
-        if not job:
-
-            raise HTTPException(
-
-                status_code=404,
-
-                detail="Job not found"
-            )
-
-        # ==========================================
-        # OLD VALUES
-        # ==========================================
-
-        old_dataset_name = job.get(
-            "dataset_name"
-        )
-
-        old_dataset_path = job.get(
-            "dataset_path"
-        )
-
-        old_onelake_path = job.get(
-            "onelake_path"
-        )
-
-        # ==========================================
-        # NEW DATASET NAME
-        # ==========================================
-
-        new_dataset_base = (
-
-            req.new_name
-            .replace(" ", "_")
-            .replace("-", "_")
-            .lower()
-            .strip()
-        )
-
-        if not new_dataset_base.endswith(
-            "_dataset"
-        ):
-
-            new_dataset_base += (
-                "_dataset"
-            )
-
-        # ==========================================
-        # DATASET FILE
-        # ==========================================
-
-        new_dataset_name = (
-            f"{new_dataset_base}.csv"
-        )
-
-        # ==========================================
-        # NEW BLOB PATH
-        # ==========================================
-
-        new_dataset_path = (
-
-            f"{req.user_id}/"
-            f"{req.job_id}/"
-            f"{new_dataset_name}"
-        )
-
-        # ==========================================
-        # NEW ONELAKE PATH
-        # ==========================================
-
-        new_onelake_path = (
-
-            f"Files/Datasets/"
-            f"{req.user_id}/"
-            f"{req.job_id}/"
-            f"{new_dataset_name}"
-        )
-
-        # ==========================================
-        # RENAME BLOB
-        # ==========================================
-
-        container = (
-
-            blob_service
-            .get_container_client(
-                V_DATASET_CONTAINER
-            )
-        )
-
-        old_blob = container.get_blob_client(
-            old_dataset_path
-        )
-
-        if not old_blob.exists():
-
-            raise HTTPException(
-
-                status_code=404,
-
-                detail=(
-                    "Dataset blob "
-                    "not found"
-                )
-            )
-
-        new_blob = container.get_blob_client(
-            new_dataset_path
-        )
-
-        # ==========================================
-        # COPY BLOB
-        # ==========================================
-
-        new_blob.start_copy_from_url(
-            old_blob.url
-        )
-
-        props = (
-            new_blob
-            .get_blob_properties()
-        )
-
-        while props.copy.status == "pending":
-
-            props = (
-                new_blob
-                .get_blob_properties()
-            )
-
-        if props.copy.status != "success":
-
-            raise Exception(
-                "Blob rename failed"
-            )
-
-        # ==========================================
-        # DELETE OLD BLOB
-        # ==========================================
 
         old_blob.delete_blob()
 
@@ -1898,52 +1784,31 @@ def rename_dataset(req: RenameDatasetRequest):
         )
 
         # ==========================================
-        # RENAME ONELAKE
-        # ==========================================
-
-        upload_service.onelake_service.rename_file(
-
-            old_path=(
-                old_onelake_path
-            ),
-
-            new_path=(
-                new_onelake_path
-            )
-        )
-
-        print(
-            "✅ OneLake renamed"
-        )
-
-        # ==========================================
-        # UPDATE COSMOS JOB
+        # UPDATE COSMOS
         # ==========================================
 
         job["dataset_name"] = (
             new_dataset_name
         )
 
+        job["thread_id"] = req.thread_id
+
         job["dataset_path"] = (
             new_dataset_path
         )
 
+        # KEEP EXISTING ONELAKE PATH
         job["onelake_path"] = (
-            new_onelake_path
+            old_onelake_path
         )
 
         job["updated_at"] = (
-
-            datetime.utcnow()
-            .isoformat()
-
+            datetime.utcnow().isoformat()
             + "Z"
         )
 
         cosmos_service.update_dataset(
-
             req.user_id,
-
             job
         )
 
@@ -1952,7 +1817,7 @@ def rename_dataset(req: RenameDatasetRequest):
         )
 
         # ==========================================
-        # UPDATE CREATED DATASETS
+        # UPDATE CREATED DATASET
         # ==========================================
 
         cosmos_service.rename_created_dataset(
@@ -1961,64 +1826,89 @@ def rename_dataset(req: RenameDatasetRequest):
 
             job_id=req.job_id,
 
-            new_dataset_name=(
-                new_dataset_name
-            ),
+            new_dataset_name=new_dataset_name,
 
-            new_dataset_path=(
-                new_dataset_path
-            ),
+            new_dataset_path=new_dataset_path,
 
-            new_onelake_path=(
-                new_onelake_path
-            )
+            new_onelake_path=old_onelake_path
         )
 
         print(
-            "✅ Created datasets updated"
+            "✅ Created dataset updated"
         )
 
-        # ==========================================
-        # UPDATE THREAD CONTEXT
+
+       # ==========================================
+        # UPDATE THREAD
         # ==========================================
 
-        thread_id = job.get(
-            "thread_id"
-        )
+        job["thread_id"] = req.thread_id
 
-        if thread_id:
+        if req.thread_id:
 
             thread_service.update_context(
 
-                thread_id,
+                req.thread_id,
 
                 {
 
-                    "latest_dataset_path": (
-                        new_dataset_path
-                    ),
+                    "latest_dataset_path":
+                        new_dataset_path,
 
                     "selected_dataset": {
 
-                        "dataset_name": (
-                            new_dataset_name
-                        ),
+                        "dataset_name":
+                            new_dataset_name,
 
-                        "blob_path": (
-                            new_dataset_path
-                        ),
+                        "blob_path":
+                            new_dataset_path,
 
-                        "onelake_path": (
-                            new_onelake_path
-                        )
+                        "onelake_path":
+                            old_onelake_path
                     }
                 }
             )
 
-        print(
-            "✅ Thread updated"
-        )
+            thread_service.add_message(
 
+                thread_id=req.thread_id,
+
+                role="assistant",
+
+                content=(
+
+                    f"Dataset renamed successfully.\n\n"
+
+                    f"Old Dataset: "
+                    f"{old_dataset_name}\n"
+
+                    f"New Dataset: "
+                    f"{new_dataset_name}\n\n"
+
+                    f"Blob Path:\n"
+                    f"{new_dataset_path}\n\n"
+
+                    f"OneLake Path:\n"
+                    f"{old_onelake_path}"
+                ),
+
+                message_type="completion",
+
+                metadata={
+
+                    "job_id": req.job_id,
+
+                    "old_dataset_name": old_dataset_name,
+
+                    "new_dataset_name": new_dataset_name,
+
+                    "blob_path": new_dataset_path,
+
+                    "onelake_path": old_onelake_path
+                }
+            )
+
+            print("✅ Thread updated")
         # ==========================================
         # RESPONSE
         # ==========================================
@@ -2027,25 +1917,23 @@ def rename_dataset(req: RenameDatasetRequest):
 
             "status": "success",
 
-            "message": (
-                "Dataset renamed successfully"
-            ),
+            "message":
+                "Dataset renamed successfully",
 
-            "old_dataset_name": (
-                old_dataset_name
-            ),
+            "job_id":
+                req.job_id,
 
-            "new_dataset_name": (
-                new_dataset_name
-            ),
+            "old_dataset_name":
+                old_dataset_name,
 
-            "blob_path": (
-                new_dataset_path
-            ),
+            "new_dataset_name":
+                new_dataset_name,
 
-            "onelake_path": (
-                new_onelake_path
-            )
+            "blob_path":
+                new_dataset_path,
+
+            "onelake_path":
+                old_onelake_path
         }
 
     except Exception as e:
@@ -2056,12 +1944,9 @@ def rename_dataset(req: RenameDatasetRequest):
         )
 
         raise HTTPException(
-
             status_code=500,
-
             detail=str(e)
         )
-
 
 # =========================
 # GET JOBS
@@ -2140,21 +2025,201 @@ def get_job_details(
 
 @app.post("/generate_powerbi_dashboard")
 def generate_dashboard(req: PowerBIDashboardRequest):
+
     try:
-        result = generate_powerbi_dashboard(req.csv_blob, req.user_prompt)
-        clean_result = sanitize_for_json(result)
+
+        # =====================================
+        # GENERATE DASHBOARD
+        # =====================================
+
+        result = generate_powerbi_dashboard(
+
+            req.csv_blob,
+
+            req.user_prompt
+        )
+
+        clean_result = sanitize_for_json(
+            result
+        )
+
+        # =====================================
+        # SAVE ACTION
+        # =====================================
+
         try:
-            thread_service.add_action(req.user_id, req.job_id, {
-                "type": "powerbi",
-                "prompt": req.user_prompt,
-                "response": clean_result,
-            })
+
+            thread_service.add_action(
+
+                req.user_id,
+
+                req.job_id,
+
+                {
+
+                    "type": "powerbi",
+
+                    "prompt": req.user_prompt,
+
+                    "response": clean_result,
+                }
+            )
+
         except Exception as e:
-            print("⚠️ Thread save failed:", str(e))
-        return JSONResponse(content=clean_result)
+
+            print(
+                "⚠️ Action save failed:",
+                str(e)
+            )
+
+        # =====================================
+        # SAVE USER MESSAGE
+        # =====================================
+
+        try:
+
+            thread_service.add_message(
+
+                thread_id=req.thread_id,
+
+                role="user",
+
+                content=req.user_prompt,
+
+                message_type="query",
+
+                metadata={
+
+                    "action":
+                        "dashboard"
+                }
+            )
+
+            # =================================
+            # SAVE ASSISTANT RESPONSE
+            # =================================
+
+            thread_service.add_message(
+
+                thread_id=req.thread_id,
+
+                role="assistant",
+
+                content=(
+                    "Power BI dashboard generated successfully."
+                ),
+
+                message_type="completion",
+
+                metadata=clean_result
+            )
+
+            print(
+                "✅ Thread messages saved"
+            )
+
+        except Exception as e:
+
+            print(
+                "⚠️ Thread save failed:",
+                str(e)
+            )
+
+        # =====================================
+        # UPDATE THREAD CONTEXT
+        # =====================================
+
+        try:
+
+            thread_service.update_context(
+
+                req.thread_id,
+
+                {
+
+                    "dashboard_completed":
+                        True,
+
+                    "latest_dashboard":
+                        clean_result
+                }
+            )
+
+            print(
+                "✅ Thread context updated"
+            )
+
+        except Exception as e:
+
+            print(
+                "⚠️ Context update failed:",
+                str(e)
+            )
+
+        # =====================================
+        # UPDATE COSMOS
+        # =====================================
+
+        try:
+
+            job_doc = cosmos_service.get_dataset(
+
+                req.user_id,
+
+                req.job_id
+            )
+
+            if job_doc:
+
+                job_doc["dashboard"] = True
+
+                job_doc["dashboard_result"] = (
+                    clean_result
+                )
+
+                job_doc["thread_id"] = (
+                    req.thread_id
+                )
+
+                cosmos_service.update_dataset(
+
+                    req.user_id,
+
+                    job_doc
+                )
+
+                print(
+                    "✅ Cosmos updated"
+                )
+
+        except Exception as e:
+
+            print(
+                "⚠️ Cosmos update failed:",
+                str(e)
+            )
+
+        # =====================================
+        # RETURN RESULT
+        # =====================================
+
+        return JSONResponse(
+            content=clean_result
+        )
+
     except Exception as e:
-        print("❌ POWERBI ERROR:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+
+        print(
+            "❌ POWERBI ERROR:",
+            str(e)
+        )
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=str(e)
+        )
 
 
 # =========================
@@ -2186,11 +2251,106 @@ def run_automl(req: AutoMLRequest):
             status = poll_res.get("status")
 
             if status == "success":
-                thread_service.add_action(req.user_id, req.job_id, {
-                    "type": "automl",
-                    "prompt": req.query,
-                    "response": poll_res,
-                })
+
+                # =====================================
+                # SAVE ACTION
+                # =====================================
+
+                thread_service.add_action(
+
+                    req.user_id,
+
+                    req.job_id,
+
+                    {
+
+                        "type": "automl",
+
+                        "prompt": req.query,
+
+                        "response": poll_res,
+                    }
+                )
+
+                # =====================================
+                # SAVE USER MESSAGE
+                # =====================================
+
+                thread_service.add_message(
+
+                    thread_id=req.thread_id,
+
+                    role="user",
+
+                    content=req.query,
+
+                    message_type="query",
+
+                    metadata={
+
+                        "action": "automl"
+                    }
+                )
+
+                # =====================================
+                # SAVE ASSISTANT MESSAGE
+                # =====================================
+
+                thread_service.add_message(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    content="AutoML model build completed successfully.",
+
+                    message_type="completion",
+
+                    metadata=poll_res
+                )
+
+                # =====================================
+                # UPDATE THREAD CONTEXT
+                # =====================================
+
+                thread_service.update_context(
+
+                    req.thread_id,
+
+                    {
+
+                        "automl_completed": True,
+
+                        "automl_job_id": job_id_ext,
+
+                        "latest_automl_result": poll_res
+                    }
+                )
+
+                # =====================================
+                # UPDATE COSMOS
+                # =====================================
+
+                job_doc = cosmos_service.get_dataset(
+
+                    req.user_id,
+
+                    req.job_id
+                )
+
+                if job_doc:
+
+                    job_doc["automl"] = True
+
+                    job_doc["automl_result"] = poll_res
+
+                    cosmos_service.update_dataset(
+
+                        req.user_id,
+
+                        job_doc
+                    )
+
                 return poll_res
             elif status == "failed":
                 raise Exception("AutoML job failed")
@@ -2267,6 +2427,69 @@ async def chat(req: ChatRequest):
 
         context = thread["context"]
 
+        # =====================================================
+        # PIPELINE JOB SELECTION
+        # =====================================================
+
+        pipeline_ctx = context.get(
+            "pipeline_creation",
+            {}
+        )
+
+        if (
+            pipeline_ctx.get("active")
+            and
+            pipeline_ctx.get("step") == "select_jobs"
+            and
+            req.selected_jobs
+            and
+            len(req.selected_jobs) > 0
+            and
+            req.selected_jobs[0] != "string"
+        ):
+
+            pipeline_ctx["selected_jobs"] = (
+                req.selected_jobs
+            )
+
+            pipeline_ctx["step"] = (
+                "pipeline_name"
+            )
+
+            thread_service.update_context(
+
+                req.thread_id,
+
+                {
+
+                    "pipeline_creation": {
+
+                        "active": True,
+
+                        "step": "select_jobs",
+
+                        "selected_jobs": [],
+
+                        "pipeline_name": None,
+
+                        "frequency": None,
+
+                        "start_date": None,
+
+                        "time_utc": None
+                    }
+                }
+            )
+
+            return {
+
+                "status":
+                    "pipeline_name_required",
+
+                "message":
+                    "Enter pipeline name."
+            }
+
         # ==========================================
         # DETECT INTENT
         # ==========================================
@@ -2298,6 +2521,275 @@ async def chat(req: ChatRequest):
             return result
 
         intent = result["intent"]
+
+        # =====================================================
+        # PIPELINE CREATION FLOW
+        # =====================================================
+
+        pipeline_ctx = context.get(
+            "pipeline_creation",
+            {}
+        )
+
+        if req.message.lower().strip() == "create pipeline":
+
+            thread_service.update_context(
+
+                req.thread_id,
+
+                {
+
+                    "pipeline_creation": {
+
+                        "active": False
+                    }
+                }
+            )
+
+            pipeline_ctx = {}
+
+        if pipeline_ctx.get("active"):
+
+            step = pipeline_ctx.get("step")
+
+            # ==========================================
+            # STEP 1 -> PIPELINE NAME
+            # ==========================================
+
+            if step == "pipeline_name":
+
+                pipeline_ctx["pipeline_name"] = req.message
+                pipeline_ctx["step"] = "frequency"
+
+                thread_service.update_context(
+
+                    req.thread_id,
+
+                    {
+                        "pipeline_creation":
+                            pipeline_ctx
+                    }
+                )
+
+                return {
+
+                    "status":
+                        "pipeline_frequency_required",
+
+                    "message":
+                        "Enter frequency: daily, weekly or monthly"
+                }
+
+            # ==========================================
+            # STEP 2 -> FREQUENCY
+            # ==========================================
+
+            elif step == "frequency":
+
+                freq = req.message.lower().strip()
+
+                if freq not in [
+                    "daily",
+                    "weekly",
+                    "monthly"
+                ]:
+
+                    return {
+
+                        "status": "error",
+
+                        "message":
+                            "Frequency must be daily, weekly or monthly."
+                    }
+
+                pipeline_ctx["frequency"] = freq
+
+                pipeline_ctx["step"] = (
+                    "start_date"
+                )
+
+                thread_service.update_context(
+
+                    req.thread_id,
+
+                    {
+                        "pipeline_creation":
+                            pipeline_ctx
+                    }
+                )
+
+                return {
+
+                    "status":
+                        "pipeline_start_date_required",
+
+                    "message":
+                        "Enter start date (YYYY-MM-DD)"
+                }
+
+            # ==========================================
+            # STEP 3 -> START DATE
+            # ==========================================
+
+            elif step == "start_date":
+
+                pipeline_ctx["start_date"] = (
+                    req.message
+                )
+
+                pipeline_ctx["step"] = (
+                    "time"
+                )
+
+                thread_service.update_context(
+
+                    req.thread_id,
+
+                    {
+                        "pipeline_creation":
+                            pipeline_ctx
+                    }
+                )
+
+                return {
+
+                    "status":
+                        "pipeline_time_required",
+
+                    "message":
+                        "Enter time (HH:MM)"
+                }
+
+            # ==========================================
+            # STEP 4 -> TIME
+            # ==========================================
+
+            elif step == "time":
+
+                pipeline_ctx["time_utc"] = (
+                    req.message
+                )
+
+                # ======================================
+                # CREATE PIPELINE
+                # ======================================
+
+                pipeline_doc = {
+
+                    "pipeline_id":
+                        generate_pipeline_id(),
+
+                    "name":
+                        pipeline_ctx[
+                            "pipeline_name"
+                        ],
+
+                    "created_at":
+                        datetime.utcnow()
+                        .isoformat()
+                        + "Z",
+
+                    "job_ids":
+                        pipeline_ctx[
+                            "selected_jobs"
+                        ],
+
+                    "status":
+                        "ACTIVE",
+
+                    "last_run":
+                        None,
+
+                    "description":
+                        "",
+
+                    "last_run_started_at":
+                        None,
+
+                    "last_run_result":
+                        None,
+
+                    "updated_at":
+                        datetime.utcnow()
+                        .isoformat()
+                        + "Z",
+
+                    "schedule": {
+
+                        "frequency":
+                            pipeline_ctx[
+                                "frequency"
+                            ],
+
+                        "time_utc":
+                            pipeline_ctx[
+                                "time_utc"
+                            ],
+
+                        "scheduled_at":
+                            pipeline_ctx[
+                                "start_date"
+                            ],
+
+                        "active":
+                            True
+                    }
+                }
+
+                cosmos_service.save_pipeline(
+
+                    req.user_id,
+
+                    pipeline_doc
+                )
+
+                thread_service.update_context(
+
+                    req.thread_id,
+
+                    {
+
+                        "pipeline_creation": {
+
+                            "active": False
+                        }
+                    }
+                )
+
+                thread_service.add_message(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    content=(
+
+                        f"Pipeline "
+                        f"{pipeline_doc['name']} "
+                        f"created successfully."
+                    ),
+
+                    message_type="completion",
+
+                    metadata=pipeline_doc
+                )
+
+                return {
+
+                    "status":
+                        "success",
+
+                    "message":
+                        "Pipeline created successfully.",
+
+                    "pipeline_id":
+                        pipeline_doc[
+                            "pipeline_id"
+                        ],
+
+                    "pipeline":
+                        pipeline_doc
+                }
 
         # =====================================================
         # ETL
@@ -2820,198 +3312,69 @@ async def chat(req: ChatRequest):
             ]
 
             return response
-
-
+        
         # =====================================================
-        # DASHBOARD
+        # PIPELINE
         # =====================================================
 
-        elif intent == "dashboard":
+        elif intent == "pipeline":
 
-            dataset = context.get(
-                "selected_dataset"
+            jobs = (
+                cosmos_service
+                .list_jobs_for_pipeline(
+                    req.user_id
+                )
             )
 
-            if not dataset:
+            if not jobs:
 
                 return {
 
                     "status": "error",
 
-                    "message": (
-                        "Please upload or "
-                        "generate dataset first."
-                    )
+                    "message":
+                        "No eligible jobs found."
                 }
-
-            if not dataset.get(
-                "onelake_path"
-            ):
-
-                return {
-
-                    "status": "error",
-
-                    "message": (
-                        "Please save job first "
-                        "before generating dashboard."
-                    )
-                }
-
-            response = (
-                powerbi_service
-                .generate_dashboard(
-
-                    dataset["onelake_path"]
-                )
-            )
-
-            job_doc = cosmos_service.get_dataset(
-
-                req.user_id,
-
-                req.job_id
-            )
-
-            if job_doc:
-
-                job_doc["dashboard"] = True
-
-                cosmos_service.update_dataset(
-
-                    req.user_id,
-
-                    job_doc
-                )
 
             thread_service.update_context(
 
                 req.thread_id,
 
                 {
-                    "dashboard_completed": True
+
+                    "pipeline_creation": {
+
+                        "active": True,
+
+                        "step":
+                            "select_jobs",
+
+                        "selected_jobs":
+                            [],
+
+                        "pipeline_name":
+                            None,
+
+                        "frequency":
+                            None,
+
+                        "start_date":
+                            None,
+
+                        "time_utc":
+                            None
+                    }
                 }
             )
 
-            thread_service.add_message(
+            return {
 
-                thread_id=req.thread_id,
+                "status":
+                    "pipeline_job_selection_required",
 
-                role="assistant",
-
-                content=(
-                    "Dashboard generated successfully."
-                ),
-
-                message_type="completion",
-
-                metadata=response,
-            )
-
-            response["next_actions"] = [
-
-                {
-                    "action": "automl",
-                    "label": "Build AutoML Model"
-                }
-            ]
-
-            return response
-
-        # =====================================================
-        # AUTOML
-        # =====================================================
-
-        elif intent == "automl":
-
-            dataset = context.get(
-                "selected_dataset"
-            )
-
-            if not dataset:
-
-                return {
-
-                    "status": "error",
-
-                    "message": (
-                        "Please upload or "
-                        "generate dataset first."
-                    )
-                }
-
-            if not dataset.get(
-                "onelake_path"
-            ):
-
-                return {
-
-                    "status": "error",
-
-                    "message": (
-                        "Please save job first "
-                        "before running AutoML."
-                    )
-                }
-
-            response = (
-
-                upload_service
-                .upload_to_automl(
-
-                    file_path=(
-                        dataset["onelake_path"]
-                    ),
-
-                    session_id=req.session_id,
-
-                    user_email=req.user_email,
-                )
-            )
-
-            job_doc = cosmos_service.get_dataset(
-
-                req.user_id,
-
-                req.job_id
-            )
-
-            if job_doc:
-
-                job_doc["automl"] = True
-
-                cosmos_service.update_dataset(
-
-                    req.user_id,
-
-                    job_doc
-                )
-
-            thread_service.update_context(
-
-                req.thread_id,
-
-                {
-                    "automl_completed": True
-                }
-            )
-
-            thread_service.add_message(
-
-                thread_id=req.thread_id,
-
-                role="assistant",
-
-                content="AutoML started successfully.",
-
-                message_type="completion",
-
-                metadata=response,
-            )
-
-            response["next_actions"] = []
-
-            return response
+                "jobs":
+                    jobs
+            }
 
         # =====================================================
         # FALLBACK
@@ -3153,6 +3516,43 @@ onelake_service = OneLakeService()
 
 cosmos_service = CosmosService()
 
+def detect_header_row(df):
+
+    best_row = 0
+    best_score = -999
+
+    for idx in range(min(10, len(df))):
+
+        row = df.iloc[idx]
+
+        values = [
+
+            str(x).strip()
+
+            for x in row
+
+            if pd.notna(x)
+        ]
+
+        score = 0
+
+        score += len(values)
+
+        score += len(set(values))
+
+        score -= sum(
+            1
+            for v in values
+            if "unnamed" in v.lower()
+        )
+
+        if score > best_score:
+
+            best_score = score
+            best_row = idx
+
+    return best_row
+
 
 # =====================================================
 # GENERATE JOB ID
@@ -3173,7 +3573,11 @@ async def upload_dataset(
 
     user_id: str = Form(...),
 
-    dataset: UploadFile = File(...)
+    dataset: UploadFile = File(...),
+
+    sheet_name: Optional[str] = Form(None),
+
+    job_id: str = Form(None)
 ):
 
     try:
@@ -3182,7 +3586,14 @@ async def upload_dataset(
         # GENERATE JOB ID
         # ==========================================
 
-        job_id = generate_job_id()
+        if not job_id:
+
+            job_id = generate_job_id()
+
+            print(
+                f"🆕 Job ID Generated: "
+                f"{job_id}"
+            )
 
         print(
             f"🆕 Job ID Generated: "
@@ -3254,8 +3665,113 @@ async def upload_dataset(
             filename.endswith(".xls")
         ):
 
-            df = pd.read_excel(
+            excel_file = pd.ExcelFile(
                 BytesIO(contents)
+            )
+
+            sheets = excel_file.sheet_names
+
+            # ======================================
+            # INVALID SHEET CHECK
+            # ======================================
+
+            if sheet_name and sheet_name not in sheets:
+
+                return {
+
+                    "status": "sheet_selection_required",
+
+
+                    "message": (
+                        "Please select a valid sheet."
+                    ),
+
+                    "job_id": job_id,
+
+                    "sheets": sheets
+                }
+
+            print(
+                f"📄 Available Sheets: {sheets}"
+            )
+
+            # ======================================
+            # MULTIPLE SHEETS
+            # ======================================
+
+            if len(sheets) > 1 and not sheet_name:
+
+                return {
+
+                    "status":
+                        "sheet_selection_required",
+
+                    "message":
+                        "This workbook contains multiple sheets. Please select one.",
+
+                    "job_id":
+                        job_id,
+
+                    "file_name":
+                        dataset.filename,
+
+                    "sheets":
+                        sheets
+                }
+
+            selected_sheet = (
+
+                sheet_name
+
+                if sheet_name
+
+                else sheets[0]
+            )
+
+            print(
+                f"📌 Selected Sheet: "
+                f"{selected_sheet}"
+            )
+
+            print(
+                f"Received Sheet Name: "
+                f"{sheet_name}"
+            )
+
+            # ======================================
+            # LOAD RAW SHEET
+            # ======================================
+
+            raw_df = pd.read_excel(
+
+                BytesIO(contents),
+
+                sheet_name=selected_sheet,
+
+                header=None
+            )
+
+            header_row = detect_header_row(
+                raw_df
+            )
+
+            print(
+                f"📌 Detected Header Row: "
+                f"{header_row}"
+            )
+
+            df = pd.read_excel(
+
+                BytesIO(contents),
+
+                sheet_name=selected_sheet,
+
+                header=header_row
+            )
+
+            print(
+                f"📊 Final Columns: "
+                f"{list(df.columns)}"
             )
 
         elif filename.endswith(".parquet"):
@@ -3432,6 +3948,18 @@ async def upload_dataset(
 
                 "column_names": (
                     list(df.columns)
+                ),
+
+                "sheet_name": (
+                    selected_sheet
+                    if filename.endswith((".xlsx", ".xls"))
+                    else None
+                ),
+
+                "header_row": (
+                    header_row
+                    if filename.endswith((".xlsx", ".xls"))
+                    else None
                 )
             },
 
@@ -3571,21 +4099,6 @@ async def upload_dataset(
             detail=str(e)
         )
 
-
-# =========================
-# ATTACH DATASET
-# =========================
-
-@app.post("/attach-dataset")
-def attach_dataset(req: AttachDatasetRequest):
-    dataset = thread_service.attach_dataset(req.thread_id, req.dataset)
-    thread_service.add_message(
-        thread_id=req.thread_id,
-        role="system",
-        content=f"Dataset attached: {req.dataset['dataset_name']}",
-        message_type="dataset",
-    )
-    return {"success": True, "dataset": dataset}
 
 
 # =========================
