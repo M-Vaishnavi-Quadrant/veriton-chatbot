@@ -13,6 +13,8 @@ from config import (
 
     V_CONNECTION_STRING,
 
+    BLOB_CONN_STR,
+
     USER_CONTAINER,
 
     V_DATASET_CONTAINER
@@ -318,6 +320,7 @@ class UploadService:
         user_email,
 
         file,
+
         sheet_name=None
     ):
 
@@ -345,6 +348,10 @@ class UploadService:
         # EXCEL SHEET DETECTION
         # =====================================
 
+        # =====================================
+        # EXCEL SHEET DETECTION
+        # =====================================
+
         if file.filename.lower().endswith(
             (".xlsx", ".xls")
         ):
@@ -359,13 +366,20 @@ class UploadService:
                 f"📄 Available Sheets: {sheets}"
             )
 
-            # Ask user to select sheet
+            # =================================
+            # MULTIPLE SHEETS FOUND
+            # =================================
 
-            if len(sheets) > 1 and not sheet_name:
+            if (
+
+                len(sheets) > 1
+
+                and
+
+                not sheet_name
+            ):
 
                 return {
-
-                    "success": False,
 
                     "status":
                         "sheet_selection_required",
@@ -383,14 +397,59 @@ class UploadService:
                         sheets
                 }
 
-        df = self.read_dataset(
+            # =================================
+            # INVALID SHEET
+            # =================================
 
-            file.filename,
+            if (
 
-            contents,
+                sheet_name
 
-            sheet_name
-        )
+                and
+
+                sheet_name not in sheets
+            ):
+
+                return {
+
+                    "status":
+                        "sheet_selection_required",
+
+                    "job_id":
+                        job_id,
+
+                    "thread_id":
+                        thread_id,
+
+                    "message":
+                        "Please select a valid sheet.",
+
+                    "sheets":
+                        sheets
+                }
+
+            print(
+                f"✅ Selected Sheet: "
+                f"{sheet_name}"
+            )
+
+            df = self.read_dataset(
+
+                file.filename,
+
+                contents,
+
+                sheet_name
+            )
+
+        else:
+
+            df = self.read_dataset(
+
+                file.filename,
+
+                contents
+            )
         
         selected_sheet = sheet_name
 
@@ -467,7 +526,7 @@ class UploadService:
         )
 
         print(
-            "✅ Uploaded to V_DATASET_CONTAINER"
+            "✅ Uploaded to v dataset container"
         )
 
         # ==========================================
@@ -491,6 +550,37 @@ class UploadService:
 
         print(
             f"✅ Uploaded to OneLake"
+        )
+
+                # ==========================================
+        # AUTOML REGISTRATION
+        # ==========================================
+
+        print(
+            f"🚀 Registering dataset with AutoML"
+        )
+
+        print(
+            f"📂 OneLake Path: "
+            f"{onelake_path}"
+        )
+
+        automl_response = self.upload_to_automl(
+
+            file_path=onelake_path,
+
+            session_id=session_id,
+
+            user_email=user_email
+        )
+
+        automl_registered = (
+            automl_response is not None
+        )
+
+        print(
+            f"✅ AutoML Registered: "
+            f"{automl_registered}"
         )
 
         # ==========================================
@@ -603,6 +693,12 @@ class UploadService:
             "dashboard": False,
 
             "automl": False,
+
+            "automl_registered":
+                automl_registered,
+
+            "automl_response":
+                automl_response,
 
             # ======================================
             # METADATA
@@ -869,16 +965,14 @@ class UploadService:
 
             "next_actions": [
 
-                "etl",
+                "Apply Data Quality Rules",
 
-                "dq",
+                " Apply Business Logic",
 
-                "business_logic",
+                "Apply Name Entity Resolution",
 
-                "ner",
+                "Generate Power BI Dashboard",
 
-                "dashboard",
-
-                "automl"
+                "Build Automl Model"
             ]
         }
