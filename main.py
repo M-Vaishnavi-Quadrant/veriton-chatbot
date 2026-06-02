@@ -2427,14 +2427,31 @@ async def chat(req: ChatRequest):
 
         context = thread["context"]
 
+        print("\n========== THREAD DEBUG ==========")
+        print(
+            json.dumps(
+                context,
+                indent=2
+            )
+        )
+        print("=================================\n")
         # =====================================================
-        # PIPELINE JOB SELECTION
+        # PIPELINE FLOW
         # =====================================================
 
         pipeline_ctx = context.get(
             "pipeline_creation",
             {}
         )
+
+        print(
+            "PIPELINE STATE:",
+            pipeline_ctx
+        )
+
+        # =====================================================
+        # STEP 0 - JOB SELECTION
+        # =====================================================
 
         if (
             pipeline_ctx.get("active")
@@ -2444,8 +2461,6 @@ async def chat(req: ChatRequest):
             req.selected_jobs
             and
             len(req.selected_jobs) > 0
-            and
-            req.selected_jobs[0] != "string"
         ):
 
             pipeline_ctx["selected_jobs"] = (
@@ -2461,23 +2476,8 @@ async def chat(req: ChatRequest):
                 req.thread_id,
 
                 {
-
-                    "pipeline_creation": {
-
-                        "active": True,
-
-                        "step": "select_jobs",
-
-                        "selected_jobs": [],
-
-                        "pipeline_name": None,
-
-                        "frequency": None,
-
-                        "start_date": None,
-
-                        "time_utc": None
-                    }
+                    "pipeline_creation":
+                        pipeline_ctx
                 }
             )
 
@@ -2490,76 +2490,27 @@ async def chat(req: ChatRequest):
                     "Enter pipeline name."
             }
 
-        # ==========================================
-        # DETECT INTENT
-        # ==========================================
-
-        result = orchestrator.detect_intent(
-
-            req.message,
-
-            context
-        )
-
-        # ==========================================
-        # CONVERSATION
-        # ==========================================
-
-        if result["type"] == "conversation":
-
-            thread_service.add_message(
-
-                thread_id=req.thread_id,
-
-                role="assistant",
-
-                content=result["response"],
-
-                message_type="text",
-            )
-
-            return result
-
-        intent = result["intent"]
-
         # =====================================================
-        # PIPELINE CREATION FLOW
+        # PIPELINE WIZARD
         # =====================================================
-
-        pipeline_ctx = context.get(
-            "pipeline_creation",
-            {}
-        )
-
-        if req.message.lower().strip() == "create pipeline":
-
-            thread_service.update_context(
-
-                req.thread_id,
-
-                {
-
-                    "pipeline_creation": {
-
-                        "active": False
-                    }
-                }
-            )
-
-            pipeline_ctx = {}
 
         if pipeline_ctx.get("active"):
 
             step = pipeline_ctx.get("step")
 
             # ==========================================
-            # STEP 1 -> PIPELINE NAME
+            # PIPELINE NAME
             # ==========================================
 
             if step == "pipeline_name":
 
-                pipeline_ctx["pipeline_name"] = req.message
-                pipeline_ctx["step"] = "frequency"
+                pipeline_ctx["pipeline_name"] = (
+                    req.message
+                )
+
+                pipeline_ctx["step"] = (
+                    "frequency"
+                )
 
                 thread_service.update_context(
 
@@ -2581,12 +2532,16 @@ async def chat(req: ChatRequest):
                 }
 
             # ==========================================
-            # STEP 2 -> FREQUENCY
+            # FREQUENCY
             # ==========================================
 
             elif step == "frequency":
 
-                freq = req.message.lower().strip()
+                freq = (
+                    req.message
+                    .lower()
+                    .strip()
+                )
 
                 if freq not in [
                     "daily",
@@ -2596,13 +2551,16 @@ async def chat(req: ChatRequest):
 
                     return {
 
-                        "status": "error",
+                        "status":
+                            "error",
 
                         "message":
                             "Frequency must be daily, weekly or monthly."
                     }
 
-                pipeline_ctx["frequency"] = freq
+                pipeline_ctx["frequency"] = (
+                    freq
+                )
 
                 pipeline_ctx["step"] = (
                     "start_date"
@@ -2628,7 +2586,7 @@ async def chat(req: ChatRequest):
                 }
 
             # ==========================================
-            # STEP 3 -> START DATE
+            # START DATE
             # ==========================================
 
             elif step == "start_date":
@@ -2661,7 +2619,7 @@ async def chat(req: ChatRequest):
                 }
 
             # ==========================================
-            # STEP 4 -> TIME
+            # TIME
             # ==========================================
 
             elif step == "time":
@@ -2669,10 +2627,6 @@ async def chat(req: ChatRequest):
                 pipeline_ctx["time_utc"] = (
                     req.message
                 )
-
-                # ======================================
-                # CREATE PIPELINE
-                # ======================================
 
                 pipeline_doc = {
 
@@ -2695,7 +2649,7 @@ async def chat(req: ChatRequest):
                         ],
 
                     "status":
-                        "ACTIVE",
+                        "SUCCESS",
 
                     "last_run":
                         None,
@@ -2726,7 +2680,7 @@ async def chat(req: ChatRequest):
                                 "time_utc"
                             ],
 
-                        "scheduled_at":
+                        "start_date":
                             pipeline_ctx[
                                 "start_date"
                             ],
@@ -2756,24 +2710,6 @@ async def chat(req: ChatRequest):
                     }
                 )
 
-                thread_service.add_message(
-
-                    thread_id=req.thread_id,
-
-                    role="assistant",
-
-                    content=(
-
-                        f"Pipeline "
-                        f"{pipeline_doc['name']} "
-                        f"created successfully."
-                    ),
-
-                    message_type="completion",
-
-                    metadata=pipeline_doc
-                )
-
                 return {
 
                     "status":
@@ -2790,6 +2726,38 @@ async def chat(req: ChatRequest):
                     "pipeline":
                         pipeline_doc
                 }
+
+        # ==========================================
+        # DETECT INTENT
+        # ==========================================
+
+        result = orchestrator.detect_intent(
+
+            req.message,
+
+            context
+        )
+
+        # ==========================================
+        # CONVERSATION
+        # ==========================================
+
+        if result["type"] == "conversation":
+
+            thread_service.add_message(
+
+                thread_id=req.thread_id,
+
+                role="assistant",
+
+                content=result["response"],
+
+                message_type="text",
+            )
+
+            return result
+
+        intent = result["intent"]
 
         # =====================================================
         # ETL
