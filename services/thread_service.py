@@ -305,36 +305,38 @@ class ThreadService:
     # =====================================================
 
     def add_action(
-
         self,
-
         thread_id,
-
-        action
+        role,
+        action_type,
+        status,
+        request=None,
+        response=None
     ):
 
-        thread = self.load_thread(
-            thread_id
-        )
+        thread = self.load_thread(thread_id)
 
         if not thread:
+            raise Exception("Thread not found")
 
-            raise Exception(
-                "Thread not found"
-            )
+        action = {
+            
+            "role":role,
 
-        action["action_id"] = (
-            str(uuid.uuid4())
-        )
+            "action_id": str(uuid.uuid4()),
 
-        action["timestamp"] = (
-            datetime.utcnow()
-            .isoformat()
-        )
+            "type": action_type,
 
-        thread["actions"].append(
-            action
-        )
+            "status": status,
+
+            "request": request or {},
+
+            "response": response or {},
+
+            "timestamp": datetime.utcnow().isoformat()
+        }
+
+        thread["actions"].append(action)
 
         self.save_thread(thread)
 
