@@ -454,20 +454,6 @@ def run(req: RunRequest):
         )
 
         # ==========================================
-        # ACTION
-        # ==========================================
-
-        thread_service.add_action(
-            req.thread_id,
-            {
-                "type": "etl",
-                "status": "running",
-                "job_id": req.job_id,
-                "prompt": req.prompt,
-            },
-        )
-
-        # ==========================================
         # RUN PIPELINE
         # ==========================================
 
@@ -663,66 +649,22 @@ def run(req: RunRequest):
         thread_service.add_message(
             thread_id=req.thread_id,
             role="assistant",
-            content="Starting ETL pipeline",
+            content=(
+
+                f"✅ ETL completed successfully\n\n"
+
+                f"Dataset: {dataset_display_name}\n"
+
+                f"Rows: {final_dataset.get('rows', 0)}\n"
+
+                f"Columns: {len(final_dataset.get('columns', []))}"
+            ),
             message_type="completion",
             metadata={
                 "download_url": download_url,
-                "dataset_name": (
-                    dataset_display_name
-                ),
-                "dataset_path": (
-                    dataset_path
-                ),
-            },
-        )
-
-        # ==========================================
-        # ADD ACTION
-        # ==========================================
-
-        thread_service.add_action(
-
-            req.thread_id,
-
-            {
-
-                "type": "etl",
-
-                "status": "completed",
-
-                "job_id": req.job_id,
-
-                "job_name": job_name,
-
-                "prompt": req.prompt,
-
                 "dataset_name": dataset_display_name,
-
                 "dataset_path": dataset_path,
-
-                "download_url": download_url,
-
-                "response": {
-
-                    "data_model":
-                        result.get(
-                            "data_model"
-                        ),
-
-                    "relationships":
-                        result.get(
-                            "relationships"
-                        ),
-
-                    "schemas":
-                        result.get(
-                            "schemas"
-                        ),
-
-                    "final_dataset":
-                        final_dataset
-                }
-            }
+            },
         )
 
         # ==========================================
@@ -779,6 +721,28 @@ def run(req: RunRequest):
             ]
         }
 
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="etl",
+
+            status="completed",
+
+            request={
+
+                "prompt": req.prompt,
+
+                "job_id": req.job_id,
+
+                "user_id": req.user_id
+            },
+
+            response=response_data
+        )
+
         # ==========================================
         # SAFE SERIALIZATION
         # ==========================================
@@ -793,19 +757,45 @@ def run(req: RunRequest):
 
     except Exception as e:
 
-        print("❌ RUN ERROR:", str(e))
+        error_response = {
 
-        try:
+            "status": "failed",
 
-            thread_service.add_message(
-                thread_id=req.thread_id,
-                role="system",
-                content=str(e),
-                message_type="error",
-            )
+            "error": str(e),
 
-        except Exception:
-            pass
+            "job_id": req.job_id
+        }
+
+        thread_service.add_message(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            content=str(e),
+
+            message_type="error"
+        )
+
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="etl",
+
+            status="failed",
+
+            request={
+
+                "prompt": req.prompt,
+
+                "job_id": req.job_id
+            },
+
+            response=error_response
+        )
 
         raise HTTPException(
             status_code=500,
@@ -1398,45 +1388,7 @@ def save_job(req: SaveJobRequest):
             },
         )
 
-        # ==========================================
-        # ACTION
-        # ==========================================
-
-        thread_service.add_action(
-
-            req.thread_id,
-
-            {
-
-                "type": "save_job",
-
-                "status": "completed",
-
-                "job_id": req.job_id,
-
-                "job_name": job_name,
-
-                "dataset_name": (
-                    dataset_display_name
-                ),
-
-                "blob_path": (
-                    dataset_path
-                ),
-
-                "onelake_path": (
-                    onelake_path
-                ),
-
-                "schedule": schedule,
-            },
-        )
-
-        # ==========================================
-        # RESPONSE
-        # ==========================================
-
-        return {
+        save_job_response = {
 
             "success": True,
 
@@ -1448,62 +1400,80 @@ def save_job(req: SaveJobRequest):
 
             "thread_id": req.thread_id,
 
-            "dataset_name": (
-                dataset_display_name
-            ),
+            "dataset_name": dataset_display_name,
 
-            "blob_path": (
-                dataset_path
-            ),
+            "blob_path": dataset_path,
 
-            "onelake_path": (
-                onelake_path
-            ),
+            "onelake_path": onelake_path,
 
             "schedule": schedule,
 
             "automl_registered": (
-
-                automl_response
-                is not None
+                automl_response is not None
             ),
 
-            "automl_response": (
-                automl_response
-            ),
+            "automl_response": automl_response,
 
-            "message": (
-                assistant_message
-            ),
+            "message": assistant_message
         }
+
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="save_job",
+
+            status="completed",
+
+            request={
+
+                "job_id": req.job_id,
+
+                "user_id": req.user_id
+            },
+
+            response=save_job_response
+        )
+
+        # ==========================================
+        # RESPONSE
+        # ==========================================
+
+        return save_job_response
 
     except Exception as e:
 
-        print(
-            "❌ SAVE JOB ERROR:",
-            str(e)
+        error_response = {
+
+            "status": "failed",
+
+            "error": str(e),
+
+            "job_id": req.job_id
+        }
+
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="save_job",
+
+            status="failed",
+
+            request={
+
+                "job_id": req.job_id
+            },
+
+            response=error_response
         )
 
-        try:
-
-            thread_service.add_message(
-
-                thread_id=req.thread_id,
-
-                role="system",
-
-                content=str(e),
-
-                message_type="error",
-            )
-
-        except Exception:
-            pass
-
         raise HTTPException(
-
             status_code=500,
-
             detail=str(e)
         )
 
@@ -1594,7 +1564,7 @@ def rename_job(req: RenameJobRequest):
 
             print("✅ Thread updated")
 
-        return {
+        rename_job_response = {
 
             "status": "success",
 
@@ -1606,15 +1576,77 @@ def rename_job(req: RenameJobRequest):
 
             "old_job_name": old_job_name,
 
-            "new_job_name": new_job_name
+            "new_job_name": new_job_name,
+
+            "next_actions": [
+
+                {
+                    "action": "rename_dataset",
+                    "label": "Rename Dataset"
+                },
+
+                {
+                    "action": "dashboard",
+                    "label": "Generate Dashboard"
+                }
+            ]
         }
 
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            action_type="rename_job",
+
+            role="assistant",
+
+            status="completed",
+
+            request={
+
+                "job_id": req.job_id,
+
+                "old_job_name": old_job_name,
+
+                "requested_name": req.new_name
+            },
+
+            response=rename_job_response
+        )
+
+        return rename_job_response
+    
     except Exception as e:
 
         print(
             "❌ RENAME JOB ERROR:",
             str(e)
         )
+
+        thread_service.add_action(
+
+        thread_id=req.thread_id,
+
+        role="assistant",
+
+        action_type="rename_job",
+
+        status="failed",
+
+        request={
+
+            "job_id": req.job_id,
+
+            "requested_name": req.new_name
+        },
+
+        response={
+
+            "status": "failed",
+
+            "error": str(e)
+        }
+    )
 
         raise HTTPException(
             status_code=500,
@@ -1679,12 +1711,15 @@ def rename_dataset(req: RenameDatasetRequest):
             .strip()
         )
 
-        while base_name.endswith("_dataset"):
-            base_name = base_name[:-8]
+        if base_name.endswith("_dataset"):
 
-        new_dataset_name = (
-            f"{base_name}_dataset"
-        )
+            new_dataset_name = base_name
+
+        else:
+
+            new_dataset_name = (
+                f"{base_name}_dataset"
+            )
 
         new_dataset_file = (
             f"{new_dataset_name}.csv"
@@ -1918,11 +1953,8 @@ def rename_dataset(req: RenameDatasetRequest):
             )
 
             print("✅ Thread updated")
-        # ==========================================
-        # RESPONSE
-        # ==========================================
-
-        return {
+        
+        rename_dataset_response = {
 
             "status": "success",
 
@@ -1942,15 +1974,88 @@ def rename_dataset(req: RenameDatasetRequest):
                 new_dataset_path,
 
             "onelake_path":
-                old_onelake_path
+                old_onelake_path,
+
+            "next_actions": [
+
+                {
+                    "action": "dq",
+                    "label": "Apply Data Quality Rules"
+                },
+
+                {
+                    "action": "business_logic",
+                    "label": "Apply Business Logic"
+                },
+
+                {
+                    "action": "dashboard",
+                    "label": "Generate Dashboard"
+                },
+
+                {
+                    "action": "automl",
+                    "label": "Build AutoML Model"
+                }
+            ]
         }
 
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="rename_dataset",
+
+            status="completed",
+
+            request={
+
+                "job_id":
+                    req.job_id,
+
+                "old_dataset_name":
+                    old_dataset_name,
+
+                "requested_name":
+                    req.new_name
+            },
+
+            response=rename_dataset_response
+        )
+
+        return rename_dataset_response
     except Exception as e:
 
         print(
             "❌ RENAME DATASET ERROR:",
             str(e)
         )
+        thread_service.add_action(
+
+        thread_id=req.thread_id,
+
+        role="assistant",
+
+        action_type="rename_dataset",
+
+        status="failed",
+
+        request={
+
+            "job_id": req.job_id,
+
+            "requested_name": req.new_name
+        },
+
+        response={
+
+            "status": "failed",
+
+            "error": str(e)
+        }
+    )
 
         raise HTTPException(
             status_code=500,
@@ -2031,7 +2136,6 @@ def get_job_details(
 # =========================
 # GENERATE POWERBI DASHBOARD
 # =========================
-
 @app.post("/generate_powerbi_dashboard")
 def generate_dashboard(
     req: PowerBIDashboardRequest
@@ -2044,9 +2148,7 @@ def generate_dashboard(
         # =====================================
 
         result = generate_powerbi_dashboard(
-
             req.csv_blob,
-
             req.user_prompt
         )
 
@@ -2055,20 +2157,94 @@ def generate_dashboard(
         )
 
         # =====================================
-        # SAVE POWERBI ACTION
+        # BUILD FINAL RESPONSE
+        # (store exactly what frontend gets)
+        # =====================================
+
+        dashboard_response = {
+
+            **clean_result,
+
+            "action_type": "dashboard",
+
+            "next_actions": [
+
+                {
+                    "action": "save_job",
+                    "label": "Save Job"
+                },
+
+                {
+                    "action": "automl",
+                    "label": "Build AutoML Model"
+                }
+            ]
+        }
+
+        # =====================================
+        # SAVE ASSISTANT MESSAGE
+        # =====================================
+
+        try:
+
+            thread_service.add_message(
+
+                thread_id=req.thread_id,
+
+                role="assistant",
+
+                message_type="completion",
+
+                content="✅ Power BI Dashboard generated successfully.",
+
+                metadata={
+
+                    "dashboard_generated": True,
+
+                    "total_kpis":
+                        dashboard_response.get(
+                            "total_kpis_discovered",
+                            0
+                        ),
+
+                    "visual_count":
+                        len(
+                            dashboard_response.get(
+                                "visuals",
+                                []
+                            )
+                        )
+                }
+            )
+
+            print(
+                "✅ Dashboard message saved"
+            )
+
+        except Exception as e:
+
+            print(
+                "⚠️ Dashboard message save failed:",
+                str(e)
+            )
+
+        # =====================================
+        # SAVE ACTION
         # =====================================
 
         try:
 
             thread_service.add_action(
 
-                req.thread_id,
+                thread_id=req.thread_id,
 
-                {
+                role="assistant",
 
-                    "type": "powerbi",
+                action_type="dashboard",
 
-                    "status": "completed",
+                status="completed",
+
+                request={
 
                     "job_id":
                         req.job_id,
@@ -2076,22 +2252,24 @@ def generate_dashboard(
                     "user_id":
                         req.user_id,
 
-                    "prompt":
-                        req.user_prompt,
+                    "csv_blob":
+                        req.csv_blob,
 
-                    "response":
-                        clean_result
-                }
+                    "prompt":
+                        req.user_prompt
+                },
+
+                response=dashboard_response
             )
 
             print(
-                "✅ PowerBI action saved"
+                "✅ Dashboard action saved"
             )
 
         except Exception as e:
 
             print(
-                "⚠️ PowerBI action save failed:",
+                "⚠️ Dashboard action save failed:",
                 str(e)
             )
 
@@ -2108,7 +2286,10 @@ def generate_dashboard(
                 {
 
                     "dashboard_completed":
-                        True
+                        True,
+
+                    "latest_dashboard":
+                        dashboard_response
                 }
             )
 
@@ -2141,7 +2322,7 @@ def generate_dashboard(
                 job_doc["dashboard"] = True
 
                 job_doc["dashboard_result"] = (
-                    clean_result
+                    dashboard_response
                 )
 
                 job_doc["thread_id"] = (
@@ -2149,6 +2330,7 @@ def generate_dashboard(
                 )
 
                 job_doc["updated_at"] = (
+
                     datetime.utcnow().isoformat()
                     + "Z"
                 )
@@ -2172,164 +2354,411 @@ def generate_dashboard(
             )
 
         # =====================================
-        # RETURN RESULT
+        # RETURN EXACT RESPONSE
         # =====================================
 
         return JSONResponse(
 
-            content=clean_result
+            content=dashboard_response
         )
 
     except Exception as e:
 
-        print(
-            "❌ POWERBI ERROR:",
-            str(e)
+        dashboard_error = {
+
+            "status": "failed",
+
+            "error": str(e)
+        }
+
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="dashboard",
+
+            status="failed",
+
+            request={
+
+                "job_id": req.job_id,
+
+                "prompt": req.user_prompt
+            },
+
+            response=dashboard_error
         )
 
         raise HTTPException(
-
             status_code=500,
-
             detail=str(e)
         )
-
 # =========================
-# AUTOML RUN
+# AUTOML
 # =========================
 
 @app.post("/automl/run")
 def run_automl(req: AutoMLRequest):
+
     try:
+
+        # =====================================
+        # START AUTOML
+        # =====================================
+
         start_res = requests.post(
+
             "https://api.veriton.ai/api/service3/process_task_query_v",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "session_id": req.session_id,
-                "query": req.query,
-                "user_email": req.user_email,
+
+            headers={
+                "Content-Type":
+                    "application/x-www-form-urlencoded"
             },
+
+            data={
+
+                "session_id":
+                    req.session_id,
+
+                "query":
+                    req.query,
+
+                "user_email":
+                    req.user_email,
+            },
+
         ).json()
 
         if start_res.get("status") != "started":
-            raise Exception("Failed to start AutoML")
 
-        job_id_ext = start_res.get("job_id")
-        status_url = f"https://api.veriton.ai/api/service3/process-task-query-status/{job_id_ext}"
+            raise Exception(
+                "Failed to start AutoML"
+            )
+
+        job_id_ext = start_res.get(
+            "job_id"
+        )
+
+        status_url = (
+
+            "https://api.veriton.ai/api/service3/"
+            f"process-task-query-status/{job_id_ext}"
+        )
+
+        # =====================================
+        # POLL
+        # =====================================
 
         while True:
-            time.sleep(start_res.get("poll_every_seconds", 10))
-            poll_res = requests.get(status_url, params={"user_email": req.user_email}).json()
-            status = poll_res.get("status")
+
+            time.sleep(
+
+                start_res.get(
+                    "poll_every_seconds",
+                    10
+                )
+            )
+
+            poll_res = requests.get(
+
+                status_url,
+
+                params={
+                    "user_email":
+                        req.user_email
+                }
+
+            ).json()
+
+            status = poll_res.get(
+                "status"
+            )
+
+            # =====================================
+            # SUCCESS
+            # =====================================
 
             if status == "success":
 
-                # =====================================
-                # SAVE ACTION
-                # =====================================
+                automl_response = {
 
-                thread_service.add_action(
+                    **poll_res,
 
-                    req.user_id,
+                    "action_type":
+                        "automl",
 
-                    req.job_id,
+                    "next_actions": [
 
-                    {
+                        {
+                            "action":
+                                "save_job",
 
-                        "type": "automl",
+                            "label":
+                                "Save Job"
+                        },
 
-                        "prompt": req.query,
+                        {
+                            "action":
+                                "dashboard",
 
-                        "response": poll_res,
-                    }
-                )
+                            "label":
+                                "Generate Dashboard"
+                        }
+                    ]
+                }
 
                 # =====================================
                 # SAVE USER MESSAGE
                 # =====================================
 
-                thread_service.add_message(
+                try:
 
-                    thread_id=req.thread_id,
+                    thread_service.add_message(
 
-                    role="user",
+                        thread_id=req.thread_id,
 
-                    content=req.query,
+                        role="user",
 
-                    message_type="query",
+                        content=req.query,
 
-                    metadata={
+                        message_type="query",
 
-                        "action": "automl"
-                    }
-                )
+                        metadata={
+
+                            "action":
+                                "automl"
+                        }
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "⚠️ User message save failed:",
+                        str(e)
+                    )
 
                 # =====================================
                 # SAVE ASSISTANT MESSAGE
                 # =====================================
 
-                thread_service.add_message(
+                try:
 
-                    thread_id=req.thread_id,
+                    thread_service.add_message(
 
-                    role="assistant",
+                        thread_id=req.thread_id,
 
-                    content="AutoML model build completed successfully.",
+                        role="assistant",
 
-                    message_type="completion",
+                        content=(
+                            "✅ AutoML model build "
+                            "completed successfully."
+                        ),
 
-                    metadata=poll_res
-                )
+                        message_type="completion",
+
+                        metadata={
+
+                            "job_id":
+                                job_id_ext,
+
+                            "action":
+                                "automl"
+                        }
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "⚠️ Assistant message save failed:",
+                        str(e)
+                    )
+
+                # =====================================
+                # SAVE ACTION
+                # =====================================
+
+                try:
+
+                    thread_service.add_action(
+
+                        thread_id=req.thread_id,
+
+                        role="assistant",
+
+                        action_type="automl",
+
+                        status="completed",
+
+                        request={
+
+                            "job_id":
+                                req.job_id,
+
+                            "user_id":
+                                req.user_id,
+
+                            "session_id":
+                                req.session_id,
+
+                            "query":
+                                req.query,
+
+                            "user_email":
+                                req.user_email
+                        },
+
+                        response=automl_response
+                    )
+
+                    print(
+                        "✅ AutoML action saved"
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "⚠️ AutoML action save failed:",
+                        str(e)
+                    )
 
                 # =====================================
                 # UPDATE THREAD CONTEXT
                 # =====================================
 
-                thread_service.update_context(
+                try:
 
-                    req.thread_id,
+                    thread_service.update_context(
 
-                    {
+                        req.thread_id,
 
-                        "automl_completed": True,
+                        {
 
-                        "automl_job_id": job_id_ext,
+                            "automl_completed":
+                                True,
 
-                        "latest_automl_result": poll_res
-                    }
-                )
+                            "automl_job_id":
+                                job_id_ext,
+
+                            "latest_automl_result":
+                                automl_response
+                        }
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "⚠️ Context update failed:",
+                        str(e)
+                    )
 
                 # =====================================
                 # UPDATE COSMOS
                 # =====================================
 
-                job_doc = cosmos_service.get_dataset(
+                try:
 
-                    req.user_id,
+                    job_doc = (
 
-                    req.job_id
-                )
+                        cosmos_service
+                        .get_dataset(
 
-                if job_doc:
+                            req.user_id,
 
-                    job_doc["automl"] = True
-
-                    job_doc["automl_result"] = poll_res
-
-                    cosmos_service.update_dataset(
-
-                        req.user_id,
-
-                        job_doc
+                            req.job_id
+                        )
                     )
 
-                return poll_res
+                    if job_doc:
+
+                        job_doc[
+                            "automl"
+                        ] = True
+
+                        job_doc[
+                            "automl_result"
+                        ] = automl_response
+
+                        job_doc[
+                            "thread_id"
+                        ] = req.thread_id
+
+                        job_doc[
+                            "updated_at"
+                        ] = (
+
+                            datetime.utcnow()
+                            .isoformat()
+
+                            + "Z"
+                        )
+
+                        cosmos_service.update_dataset(
+
+                            req.user_id,
+
+                            job_doc
+                        )
+
+                        print(
+                            "✅ Cosmos updated"
+                        )
+
+                except Exception as e:
+
+                    print(
+                        "⚠️ Cosmos update failed:",
+                        str(e)
+                    )
+
+                # =====================================
+                # RETURN EXACT RESPONSE
+                # =====================================
+
+                return automl_response
+
+            # =====================================
+            # FAILED
+            # =====================================
+
             elif status == "failed":
-                raise Exception("AutoML job failed")
+
+                raise Exception(
+                    "AutoML job failed"
+                )
 
     except Exception as e:
-        print("❌ AutoML error:", str(e))
-        raise HTTPException(status_code=500, detail=str(e))
+
+        automl_error = {
+
+            "status": "failed",
+
+            "error": str(e)
+        }
+
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="automl",
+
+            status="failed",
+
+            request={
+
+                "query": req.query
+            },
+
+            response=automl_error
+        )
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
 
 # =========================
@@ -2453,7 +2882,7 @@ async def chat(req: ChatRequest):
                 }
             )
 
-            return {
+            pipeline_response = {
 
                 "status":
                     "pipeline_name_required",
@@ -2461,6 +2890,25 @@ async def chat(req: ChatRequest):
                 "message":
                     "Enter pipeline name."
             }
+
+            thread_service.add_action(
+
+                thread_id=req.thread_id,
+
+                role = "assistant",
+
+                action_type="pipeline_wizard",
+
+                status="waiting",
+
+                request={
+                    "step": "pipeline_name"
+                },
+
+                response=pipeline_response
+            )
+
+            return pipeline_response
 
         # =====================================================
         # PIPELINE WIZARD
@@ -2494,7 +2942,7 @@ async def chat(req: ChatRequest):
                     }
                 )
 
-                return {
+                pipeline_response = {
 
                     "status":
                         "pipeline_frequency_required",
@@ -2502,6 +2950,25 @@ async def chat(req: ChatRequest):
                     "message":
                         "Enter frequency: daily, weekly or monthly"
                 }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role = "assistant",
+
+                    action_type="pipeline_wizard",
+
+                    status="waiting",
+
+                    request={
+                        "step": "frequency"
+                    },
+
+                    response=pipeline_response
+                )
+
+                return pipeline_response
 
             # ==========================================
             # FREQUENCY
@@ -2516,19 +2983,37 @@ async def chat(req: ChatRequest):
                 )
 
                 if freq not in [
-                    "daily",
-                    "weekly",
-                    "monthly"
-                ]:
+                        "daily",
+                        "weekly",
+                        "monthly"
+                    ]:
 
-                    return {
+                        error_response = {
 
-                        "status":
-                            "error",
+                            "status": "failed",
 
-                        "message":
-                            "Frequency must be daily, weekly or monthly."
-                    }
+                            "message":
+                                "Frequency must be daily, weekly or monthly."
+                        }
+
+                        thread_service.add_action(
+
+                            thread_id=req.thread_id,
+
+                            role="assistant",
+
+                            action_type="pipeline_wizard",
+
+                            status="failed",
+
+                            request={
+                                "frequency": req.message
+                            },
+
+                            response=error_response
+                        )
+
+                        return error_response
 
                 pipeline_ctx["frequency"] = (
                     freq
@@ -2548,7 +3033,7 @@ async def chat(req: ChatRequest):
                     }
                 )
 
-                return {
+                pipeline_response = {
 
                     "status":
                         "pipeline_start_date_required",
@@ -2556,6 +3041,25 @@ async def chat(req: ChatRequest):
                     "message":
                         "Enter start date (YYYY-MM-DD)"
                 }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role = "assistant",
+
+                    action_type="pipeline_wizard",
+
+                    status="waiting",
+
+                    request={
+                        "step": "start_date"
+                    },
+
+                    response=pipeline_response
+                )
+
+                return pipeline_response
 
             # ==========================================
             # START DATE
@@ -2581,7 +3085,7 @@ async def chat(req: ChatRequest):
                     }
                 )
 
-                return {
+                pipeline_response = {
 
                     "status":
                         "pipeline_time_required",
@@ -2589,6 +3093,25 @@ async def chat(req: ChatRequest):
                     "message":
                         "Enter time (HH:MM)"
                 }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role = "assistant",
+
+                    action_type="pipeline_wizard",
+
+                    status="waiting",
+
+                    request={
+                        "step": "time"
+                    },
+
+                    response=pipeline_response
+                )
+
+                return pipeline_response
 
             # ==========================================
             # TIME
@@ -2682,7 +3205,7 @@ async def chat(req: ChatRequest):
                     }
                 )
 
-                return {
+                pipeline_response = {
 
                     "status":
                         "success",
@@ -2691,14 +3214,59 @@ async def chat(req: ChatRequest):
                         "Pipeline created successfully.",
 
                     "pipeline_id":
-                        pipeline_doc[
-                            "pipeline_id"
-                        ],
+                        pipeline_doc["pipeline_id"],
 
                     "pipeline":
-                        pipeline_doc
+                        pipeline_doc,
+
+                    "next_actions": [
+
+                        {
+                            "action":
+                                "view_pipeline",
+
+                            "label":
+                                "View Pipeline"
+                        }
+                    ]
                 }
 
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    action_type="pipeline",
+
+                    status="completed",
+
+                    request={
+
+                        "pipeline_name":
+                            pipeline_ctx["pipeline_name"],
+
+                        "selected_jobs":
+                            pipeline_ctx["selected_jobs"]
+                    },
+
+                    response=pipeline_response
+                )
+
+                thread_service.add_message(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    content="Pipeline created successfully.",
+
+                    message_type="completion",
+
+                    metadata=pipeline_response
+                )
+
+                return pipeline_response
         # ==========================================
         # DETECT INTENT
         # ==========================================
@@ -2727,150 +3295,32 @@ async def chat(req: ChatRequest):
                 message_type="text",
             )
 
-            return result
-
-        intent = result["intent"]
-
-        # =====================================================
-        # ETL
-        # =====================================================
-
-        if intent == "etl":
-
-            thread_service.add_message(
-
-                thread_id=req.thread_id,
-
-                role="assistant",
-
-                content="Starting ETL pipeline...",
-
-                message_type="status",
-            )
-
             thread_service.add_action(
 
-                req.thread_id,
-
-                {
-
-                    "type": "etl",
-
-                    "status": "running",
-
-                    "job_id": req.job_id,
-
-                    "prompt": req.message
-                },
-            )
-
-            response = pipeline_service.run(
-
-                prompt=req.message,
-
-                user_id=req.user_id,
-
-                job_id=req.job_id
-            )
-
-            final_dataset = (
-                response.get(
-                    "final_dataset"
-                )
-                or {}
-            )
-
-            dataset_info = {
-
-                "dataset_name": (
-                    final_dataset.get(
-                        "dataset_name"
-                    )
-                ),
-
-                "blob_path": (
-                    final_dataset.get(
-                        "dataset_path"
-                    )
-                ),
-
-                "onelake_path": (
-                    final_dataset.get(
-                        "onelake_path"
-                    )
-                ),
-
-                "source": "etl",
-            }
-
-            thread_service.update_context(
-
-                req.thread_id,
-
-                {
-
-                    "etl_completed": True,
-
-                    "latest_dataset_path": (
-                        final_dataset.get(
-                            "dataset_path"
-                        )
-                    ),
-
-                    "selected_dataset": (
-                        dataset_info
-                    ),
-                },
-            )
-
-            thread_service.add_message(
-
                 thread_id=req.thread_id,
 
                 role="assistant",
 
-                content="ETL completed successfully",
+                action_type="conversation",
 
-                message_type="completion",
+                status="completed",
 
-                metadata=response,
+                request={
+                    "message": req.message
+                },
+
+                response=result
             )
 
-            response["next_actions"] = [
-
-                {
-                    "action": "dq",
-                    "label": "Apply Data Quality Rules"
-                },
-
-                {
-                    "action": "ner",
-                    "label": "Run Name Entity Resolution"
-                },
-
-                {
-                    "action": "business_logic",
-                    "label": "Apply Business Logic"
-                },
-
-                {
-                    "action": "dashboard",
-                    "label": "Generate Power BI Dashboard"
-                },
-
-                {
-                    "action": "automl",
-                    "label": "Build AutoML Model"
-                }
-            ]
-
-            return response
+            return result
+        
+        intent = result["intent"]
 
         # =====================================================
         # DQ
         # =====================================================
 
-        elif intent == "dq":
+        if intent == "dq":
 
             dataset = context.get(
                 "selected_dataset"
@@ -2878,15 +3328,33 @@ async def chat(req: ChatRequest):
 
             if not dataset:
 
-                return {
+                error_response = {
 
-                    "status": "error",
+                    "status": "failed",
 
-                    "message": (
-                        "Please upload or "
-                        "attach dataset first."
-                    )
+                    "message":
+                        "Please upload dataset first"
                 }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    action_type="dq",
+
+                    status="failed",
+
+                    request={
+
+                        "message": req.message
+                    },
+
+                    response=error_response
+                )
+
+                return error_response
 
             response = dq_service.run(
                 dataset["blob_path"]
@@ -2975,6 +3443,25 @@ async def chat(req: ChatRequest):
                 }
             ]
 
+            thread_service.add_action(
+
+                thread_id=req.thread_id,
+
+                role="assistant",
+
+                action_type="dq",
+
+                status="completed",
+
+                request={
+
+                    "dataset":
+                        dataset["blob_path"]
+                },
+
+                response=response
+            )
+
             return response
 
         # =====================================================
@@ -2989,15 +3476,32 @@ async def chat(req: ChatRequest):
 
             if not dataset:
 
-                return {
+                error_response = {
 
-                    "status": "error",
+                    "status": "failed",
 
-                    "message": (
-                        "Please upload or "
-                        "attach dataset first."
-                    )
+                    "message":
+                        "Please upload or attach dataset first."
                 }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    action_type="ner",
+
+                    status="failed",
+
+                    request={
+                        "message": req.message
+                    },
+
+                    response=error_response
+                )
+
+                return error_response
 
             response = ner_service.run(
                 dataset["blob_path"]
@@ -3077,6 +3581,25 @@ async def chat(req: ChatRequest):
                 }
             ]
 
+            thread_service.add_action(
+
+                thread_id=req.thread_id,
+
+                role="assistant",
+
+                action_type="ner",
+
+                status="completed",
+
+                request={
+
+                    "dataset":
+                        dataset["blob_path"]
+                },
+
+                response=response
+            )
+
             return response
 
         # =====================================================
@@ -3092,15 +3615,32 @@ async def chat(req: ChatRequest):
 
             if not dataset:
 
-                return {
+                error_response = {
 
-                    "status": "error",
+                    "status": "failed",
 
-                    "message": (
-                        "Please upload or "
-                        "generate dataset first."
-                    )
+                    "message":
+                        "Please upload or generate dataset first."
                 }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    action_type="business_logic",
+
+                    status="failed",
+
+                    request={
+                        "message": req.message
+                    },
+
+                    response=error_response
+                )
+
+                return error_response
 
             # ==========================================
             # RUN BUSINESS LOGIC
@@ -3124,6 +3664,25 @@ async def chat(req: ChatRequest):
                     message_type="warning",
 
                     metadata=response
+                )
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    action_type="business_logic",
+
+                    status="completed",
+
+                    request={
+
+                        "dataset":
+                            dataset["blob_path"]
+                    },
+
+                    response=response
                 )
 
                 return response
@@ -3251,8 +3810,27 @@ async def chat(req: ChatRequest):
                 }
             ]
 
+            thread_service.add_action(
+
+                thread_id=req.thread_id,
+
+                role = "assistant",
+
+                action_type="business_logic",
+
+                status="completed",
+
+                request={
+
+                    "dataset":
+                        dataset["blob_path"]
+                },
+
+                response=response
+            )
+
             return response
-        
+            
         # =====================================================
         # PIPELINE
         # =====================================================
@@ -3268,13 +3846,32 @@ async def chat(req: ChatRequest):
 
             if not jobs:
 
-                return {
+                error_response = {
 
-                    "status": "error",
+                    "status": "failed",
 
                     "message":
                         "No eligible jobs found."
                 }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    action_type="pipeline",
+
+                    status="failed",
+
+                    request={
+                        "message": req.message
+                    },
+
+                    response=error_response
+                )
+
+                return error_response
 
             thread_service.update_context(
 
@@ -3307,7 +3904,7 @@ async def chat(req: ChatRequest):
                 }
             )
 
-            return {
+            pipeline_response = {
 
                 "status":
                     "pipeline_job_selection_required",
@@ -3316,19 +3913,56 @@ async def chat(req: ChatRequest):
                     jobs
             }
 
+            thread_service.add_action(
+
+                thread_id=req.thread_id,
+
+                role = "assistant",
+
+                action_type="pipeline_wizard",
+
+                status="waiting",
+
+                request={
+                    "step": "select_jobs"
+                },
+
+                response=pipeline_response
+            )
+
+            return pipeline_response
+
         # =====================================================
         # FALLBACK
         # =====================================================
 
-        return {
+        error_response = {
 
-            "status": "error",
+            "status": "failed",
 
-            "message": (
+            "message":
                 "Intent not implemented yet."
-            )
         }
 
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="chat",
+
+            status="failed",
+
+            request={
+                "message": req.message
+            },
+
+            response=error_response
+        )
+
+        return error_response
+    
     except Exception as e:
 
         print(
@@ -3340,11 +3974,33 @@ async def chat(req: ChatRequest):
 
             thread_id=req.thread_id,
 
-            role="system",
+            role="assistant",
 
             content=str(e),
 
             message_type="error",
+        )
+
+        thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="assistant",
+
+            action_type="chat",
+
+            status="failed",
+
+            request={
+                "message": req.message
+            },
+
+            response={
+
+                "status": "failed",
+
+                "error": str(e)
+            }
         )
 
         raise HTTPException(
@@ -3427,9 +4083,6 @@ async def upload_dataset(
 # UPLOAD DATASET (no job_id)
 # =========================
 
-# =====================================================
-# IMPORTS
-# =====================================================
 
 import uuid
 import pandas as pd
@@ -3640,6 +4293,7 @@ async def upload_dataset(
             # ======================================
 
             if sheet_name and sheet_name not in sheets:
+
 
                 return {
 
@@ -4063,7 +4717,98 @@ async def upload_dataset(
             detail=str(e)
         )
 
+@app.get(
+    "/thread/{thread_id}/conversation"
+)
+def get_thread_conversation(
+    thread_id: str
+):
 
+    try:
+
+        thread = (
+            thread_service.load_thread(
+                thread_id
+            )
+        )
+
+        if not thread:
+
+            raise HTTPException(
+
+                status_code=404,
+
+                detail="Thread not found"
+            )
+
+        actions = thread.get(
+            "actions",
+            []
+        )
+
+        conversation = []
+
+        for idx, action in enumerate(actions):
+
+            conversation.append({
+
+                "turn_id":
+                    str(idx + 1),
+
+                "role":
+                    action.get(
+                        "role"
+                    ),
+
+                "action_type":
+                    action.get(
+                        "action_type"
+                    ),
+
+                "status":
+                    action.get(
+                        "status"
+                    ),
+
+                "request":
+                    action.get(
+                        "request",
+                        {}
+                    ),
+
+                "response":
+                    action.get(
+                        "response",
+                        {}
+                    ),
+
+                "timestamp":
+                    action.get(
+                        "timestamp"
+                    )
+            })
+
+        return {
+
+            "thread_id":
+                thread_id,
+
+            "conversation":
+                conversation
+        }
+
+    except HTTPException:
+
+        raise
+
+    except Exception as e:
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=str(e)
+        )
 
 # =========================
 # STARTUP
