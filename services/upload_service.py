@@ -323,388 +323,326 @@ class UploadService:
 
         sheet_name=None
     ):
+        
+        try:
 
-        # ==========================================
-        # VALIDATE THREAD
-        # ==========================================
+            # ==========================================
+            # VALIDATE THREAD
+            # ==========================================
 
-        thread = self.thread_service.load_thread(
-            thread_id
-        )
-
-        if not thread:
-
-            raise Exception(
-                "Invalid thread_id"
+            thread = self.thread_service.load_thread(
+                thread_id
             )
 
-        # ==========================================
-        # READ FILE
-        # ==========================================
+            if not thread:
 
-        contents = await file.read()
+                raise Exception(
+                    "Invalid thread_id"
+                )
 
-        # =====================================
-        # EXCEL SHEET DETECTION
-        # =====================================
+            # ==========================================
+            # READ FILE
+            # ==========================================
 
-        # =====================================
-        # EXCEL SHEET DETECTION
-        # =====================================
+            contents = await file.read()
 
-        if file.filename.lower().endswith(
-            (".xlsx", ".xls")
-        ):
+            # =====================================
+            # EXCEL SHEET DETECTION
+            # =====================================
 
-            excel_file = pd.ExcelFile(
-                BytesIO(contents)
-            )
+            # =====================================
+            # EXCEL SHEET DETECTION
+            # =====================================
 
-            sheets = excel_file.sheet_names
-
-            print(
-                f"📄 Available Sheets: {sheets}"
-            )
-
-            # =================================
-            # MULTIPLE SHEETS FOUND
-            # =================================
-
-            if (
-
-                len(sheets) > 1
-
-                and
-
-                not sheet_name
+            if file.filename.lower().endswith(
+                (".xlsx", ".xls")
             ):
 
-                return {
+                excel_file = pd.ExcelFile(
+                    BytesIO(contents)
+                )
 
-                    "status":
-                        "sheet_selection_required",
+                sheets = excel_file.sheet_names
 
-                    "job_id":
-                        job_id,
+                print(
+                    f"📄 Available Sheets: {sheets}"
+                )
 
-                    "thread_id":
-                        thread_id,
+                # =================================
+                # MULTIPLE SHEETS FOUND
+                # =================================
 
-                    "file_name":
-                        file.filename,
+                if (
 
-                    "sheets":
-                        sheets
-                }
+                    len(sheets) > 1
 
-            # =================================
-            # INVALID SHEET
-            # =================================
+                    and
 
-            if (
+                    not sheet_name
+                ):
 
-                sheet_name
+                    sheet_response = {
 
-                and
+                        "status":
+                            "sheet_selection_required",
 
-                sheet_name not in sheets
-            ):
+                        "job_id":
+                            job_id,
 
-                return {
+                        "thread_id":
+                            thread_id,
 
-                    "status":
-                        "sheet_selection_required",
+                        "file_name":
+                            file.filename,
 
-                    "job_id":
-                        job_id,
+                        "sheets":
+                            sheets
+                    }
 
-                    "thread_id":
-                        thread_id,
+                    self.thread_service.add_action(
 
-                    "message":
-                        "Please select a valid sheet.",
+                        thread_id=thread_id,
 
-                    "sheets":
-                        sheets
-                }
+                        role="assistant",
 
-            print(
-                f"✅ Selected Sheet: "
-                f"{sheet_name}"
+                        action_type="dataset_upload",
+
+                        status="waiting",
+
+                        request={
+
+                            "filename":
+                                file.filename
+                        },
+
+                        response=sheet_response
+                    )
+
+                    return sheet_response
+
+                # =================================
+                # INVALID SHEET
+                # =================================
+
+                if (
+
+                    sheet_name
+
+                    and
+
+                    sheet_name not in sheets
+                ):
+
+                    sheet_response = {
+
+                        "status":
+                            "sheet_selection_required",
+
+                        "job_id":
+                            job_id,
+
+                        "thread_id":
+                            thread_id,
+
+                        "message":
+                            "Please select a valid sheet.",
+
+                        "sheets":
+                            sheets,
+
+                        "selected_sheet":
+                            sheet_name
+                    }
+
+                    self.thread_service.add_action(
+
+                        thread_id=thread_id,
+
+                        role="assistant",
+
+                        action_type="dataset_upload",
+
+                        status="waiting",
+
+                        request={
+
+                            "filename":
+                                file.filename,
+
+                            "selected_sheet":
+                                sheet_name
+                        },
+
+                        response=sheet_response
+                    )
+
+                    return sheet_response
+
+                df = self.read_dataset(
+
+                    file.filename,
+
+                    contents,
+
+                    sheet_name
+                )
+
+            else:
+
+                df = self.read_dataset(
+
+                    file.filename,
+
+                    contents
+                )
+            
+            selected_sheet = sheet_name
+
+            # ==========================================
+            # CONVERT TO CSV
+            # ==========================================
+
+            contents = self.convert_to_csv(
+                df
             )
 
-            df = self.read_dataset(
+            # ==========================================
+            # DATASET + JOB NAME
+            # ==========================================
 
-                file.filename,
+            base_name = (
+                file.filename
+                .split(".")[0]
+            )
+
+            job_name = (
+
+                base_name
+                .replace(" ", "_")
+                .replace("-", "_")
+                .lower()
+                .strip()
+            )
+
+            # ==========================================
+            # DATASET NAME
+            # ==========================================
+
+            dataset_display_name = (
+                f"{job_name}_dataset"
+            )
+
+            dataset_file_name = (
+                f"{job_name}_dataset.csv"
+            )
+
+            # ==========================================
+            # RAW PATH
+            # ==========================================
+
+            dataset_path = (
+
+                f"{user_id}/"
+                f"{job_id}/"
+                f"{dataset_file_name}"
+            )
+
+
+            # ==========================================
+            # FINAL DATASET CONTAINER
+            # ==========================================
+
+            dataset_blob = (
+
+                self.blob_service
+                .get_blob_client(
+
+                    container=V_DATASET_CONTAINER,
+
+                    blob=dataset_path
+                )
+            )
+
+            dataset_blob.upload_blob(
 
                 contents,
 
-                sheet_name
+                overwrite=True
             )
 
-        else:
-
-            df = self.read_dataset(
-
-                file.filename,
-
-                contents
+            print(
+                "✅ Uploaded to v dataset container"
             )
-        
-        selected_sheet = sheet_name
 
-        # ==========================================
-        # CONVERT TO CSV
-        # ==========================================
+            # ==========================================
+            # ONELAKE
+            # ==========================================
 
-        contents = self.convert_to_csv(
-            df
-        )
+            onelake_path = (
 
-        # ==========================================
-        # DATASET + JOB NAME
-        # ==========================================
+                self.onelake_service
+                .upload_file(
 
-        base_name = (
-            file.filename
-            .split(".")[0]
-        )
+                    BytesIO(contents),
 
-        job_name = (
+                    user_id,
 
-            base_name
-            .replace(" ", "_")
-            .replace("-", "_")
-            .lower()
-            .strip()
-        )
+                    job_id,
 
-        # ==========================================
-        # DATASET NAME
-        # ==========================================
-
-        dataset_display_name = (
-            f"{job_name}_dataset"
-        )
-
-        dataset_file_name = (
-            f"{job_name}_dataset.csv"
-        )
-
-        # ==========================================
-        # RAW PATH
-        # ==========================================
-
-        dataset_path = (
-
-            f"{user_id}/"
-            f"{job_id}/"
-            f"{dataset_file_name}"
-        )
-
-
-        # ==========================================
-        # FINAL DATASET CONTAINER
-        # ==========================================
-
-        dataset_blob = (
-
-            self.blob_service
-            .get_blob_client(
-
-                container=V_DATASET_CONTAINER,
-
-                blob=dataset_path
+                    dataset_file_name
+                )
             )
-        )
 
-        dataset_blob.upload_blob(
-
-            contents,
-
-            overwrite=True
-        )
-
-        print(
-            "✅ Uploaded to v dataset container"
-        )
-
-        # ==========================================
-        # ONELAKE
-        # ==========================================
-
-        onelake_path = (
-
-            self.onelake_service
-            .upload_file(
-
-                BytesIO(contents),
-
-                user_id,
-
-                job_id,
-
-                dataset_file_name
+            print(
+                f"✅ Uploaded to OneLake"
             )
-        )
 
-        print(
-            f"✅ Uploaded to OneLake"
-        )
+                    # ==========================================
+            # AUTOML REGISTRATION
+            # ==========================================
 
-                # ==========================================
-        # AUTOML REGISTRATION
-        # ==========================================
-
-        print(
-            f"🚀 Registering dataset with AutoML"
-        )
-
-        print(
-            f"📂 OneLake Path: "
-            f"{onelake_path}"
-        )
-
-        automl_response = self.upload_to_automl(
-
-            file_path=onelake_path,
-
-            session_id=session_id,
-
-            user_email=user_email
-        )
-
-        automl_registered = (
-            automl_response is not None
-        )
-
-        print(
-            f"✅ AutoML Registered: "
-            f"{automl_registered}"
-        )
-
-        # ==========================================
-        # DATASET INFO
-        # ==========================================
-
-        dataset_info = {
-
-            "job_name": job_name,
-
-            "dataset_name": dataset_display_name,
-
-            "blob_path": dataset_path,
-
-            "onelake_path": onelake_path,
-
-            "source": "upload",
-
-            "rows": len(df),
-
-            "columns": len(df.columns),
-
-            "column_names": (
-                list(df.columns)
+            print(
+                f"🚀 Registering dataset with AutoML"
             )
-        }
 
-        # ==========================================
-        # COSMOS DOC
-        # ==========================================
+            print(
+                f"📂 OneLake Path: "
+                f"{onelake_path}"
+            )
 
-        doc = {
+            automl_response = self.upload_to_automl(
 
-            "id": job_id,
+                file_path=onelake_path,
 
-            "job_id": job_id,
+                session_id=session_id,
 
-            "job_name": job_name,
+                user_email=user_email
+            )
 
-            "thread_id": thread_id,
+            automl_registered = (
+                automl_response is not None
+            )
 
-            "session_id": session_id,
+            print(
+                f"✅ AutoML Registered: "
+                f"{automl_registered}"
+            )
 
-            "user_email": user_email,
+            # ==========================================
+            # DATASET INFO
+            # ==========================================
 
-            "user_id": user_id,
+            dataset_info = {
 
-            "created_at": (
+                "job_name": job_name,
 
-                datetime.utcnow()
-                .isoformat()
+                "dataset_name": dataset_display_name,
 
-                + "Z"
-            ),
+                "blob_path": dataset_path,
 
-            "completed_at": (
+                "onelake_path": onelake_path,
 
-                datetime.utcnow()
-                .isoformat()
-
-                + "Z"
-            ),
-
-            "status": "completed",
-
-            # ======================================
-            # SCHEDULE
-            # ======================================
-
-            "schedule": {
-
-                "frequency": None,
-
-                "time_utc": None,
-
-                "scheduled_at": None,
-
-                "active": True
-            },
-
-            # ======================================
-            # DATASET
-            # ======================================
-
-            "dataset_name": dataset_display_name,
-
-            "dataset_type": "uploaded",
-
-            "source_type": "upload",
-
-            "dataset_path": dataset_path,
-
-            "onelake_path": onelake_path,
-
-            "current_stage": "uploaded",
-
-            "saved": True,
-    
-
-            # ======================================
-            # PIPELINE FLAGS
-            # ======================================
-
-            "dq": False,
-
-            "ner": False,
-
-            "business_logic": False,
-
-            "dashboard": False,
-
-            "automl": False,
-
-            "automl_registered":
-                automl_registered,
-
-            "automl_response":
-                automl_response,
-
-            # ======================================
-            # METADATA
-            # ======================================
-
-            "metadata": {
+                "source": "upload",
 
                 "rows": len(df),
 
@@ -712,65 +650,161 @@ class UploadService:
 
                 "column_names": (
                     list(df.columns)
-                ),
+                )
+            }
 
-                "sheet_name":
-                    selected_sheet
-            },
+            # ==========================================
+            # COSMOS DOC
+            # ==========================================
 
-            # ======================================
-            # SOURCES
-            # ======================================
+            doc = {
 
-            "sources": [
+                "id": job_id,
 
-                "chatbot"
-            ],
+                "job_id": job_id,
 
-            # ======================================
-            # RESULTS
-            # ======================================
+                "job_name": job_name,
 
-            "results": [
+                "thread_id": thread_id,
 
-                {
-                    "source": "chatbot",
+                "session_id": session_id,
 
-                    "status": "completed",
-
-                    "effective_destination": (
-                        onelake_path
-                    )
-                }
-            ]
-        }
-
-        # ==========================================
-        # SAVE TO COSMOS
-        # ==========================================
-
-        self.cosmos_service.save_dataset(
-
-            user_id,
-
-            doc
-        )
-        # ==========================================
-        # CREATED DATASET
-        # ==========================================
-
-        dataset_doc = {
-
-            "job_id": job_id,
-
-            "custom_table_name": (
-
-                dataset_display_name
-            ),
-
-            "request_body": {
+                "user_email": user_email,
 
                 "user_id": user_id,
+
+                "created_at": (
+
+                    datetime.utcnow()
+                    .isoformat()
+
+                    + "Z"
+                ),
+
+                "completed_at": (
+
+                    datetime.utcnow()
+                    .isoformat()
+
+                    + "Z"
+                ),
+
+                "status": "completed",
+
+                # ======================================
+                # SCHEDULE
+                # ======================================
+
+                "schedule": {
+
+                    "frequency": None,
+
+                    "time_utc": None,
+
+                    "scheduled_at": None,
+
+                    "active": True
+                },
+
+                # ======================================
+                # DATASET
+                # ======================================
+
+                "dataset_name": dataset_display_name,
+
+                "dataset_type": "uploaded",
+
+                "source_type": "upload",
+
+                "dataset_path": dataset_path,
+
+                "onelake_path": onelake_path,
+
+                "current_stage": "uploaded",
+
+                "saved": True,
+        
+
+                # ======================================
+                # PIPELINE FLAGS
+                # ======================================
+
+                "dq": False,
+
+                "ner": False,
+
+                "business_logic": False,
+
+                "dashboard": False,
+
+                "automl": False,
+
+                "automl_registered":
+                    automl_registered,
+
+                "automl_response":
+                    automl_response,
+
+                # ======================================
+                # METADATA
+                # ======================================
+
+                "metadata": {
+
+                    "rows": len(df),
+
+                    "columns": len(df.columns),
+
+                    "column_names": (
+                        list(df.columns)
+                    ),
+
+                    "sheet_name":
+                        selected_sheet
+                },
+
+                # ======================================
+                # SOURCES
+                # ======================================
+
+                "sources": [
+
+                    "chatbot"
+                ],
+
+                # ======================================
+                # RESULTS
+                # ======================================
+
+                "results": [
+
+                    {
+                        "source": "chatbot",
+
+                        "status": "completed",
+
+                        "effective_destination": (
+                            onelake_path
+                        )
+                    }
+                ]
+            }
+
+            # ==========================================
+            # SAVE TO COSMOS
+            # ==========================================
+
+            self.cosmos_service.save_dataset(
+
+                user_id,
+
+                doc
+            )
+            # ==========================================
+            # CREATED DATASET
+            # ==========================================
+
+            dataset_doc = {
 
                 "job_id": job_id,
 
@@ -779,200 +813,310 @@ class UploadService:
                     dataset_display_name
                 ),
 
-                "column_mappings": [],
+                "request_body": {
 
-                "join_type": "INNER"
-            },
+                    "user_id": user_id,
 
-            "file_path": dataset_path,
+                    "job_id": job_id,
 
-            "rows": len(df),
+                    "custom_table_name": (
 
-            "columns": list(df.columns),
+                        dataset_display_name
+                    ),
 
-            "timestamp": (
+                    "column_mappings": [],
 
-                datetime.utcnow()
-                .isoformat()
-            )
-        }
+                    "join_type": "INNER"
+                },
 
-        self.cosmos_service.save_create_dataset(
-
-            user_id,
-
-            dataset_doc
-        )
-
-        print(
-            "✅ Saved to Cosmos"
-        )
-
-        # ==========================================
-        # ATTACH DATASET TO THREAD
-        # ==========================================
-
-        self.thread_service.attach_dataset(
-
-            thread_id,
-
-            dataset_info
-        )
-
-        # ==========================================
-        # SAVE USER MESSAGE
-        # ==========================================
-
-        self.thread_service.add_message(
-
-            thread_id=thread_id,
-
-            role="user",
-
-            content=(
-                f"Uploaded dataset "
-                f"{dataset_display_name}"
-            ),
-
-            message_type="dataset"
-        )
-
-        # ==========================================
-        # SAVE ACTION
-        # ==========================================
-
-        self.thread_service.add_action(
-
-            thread_id,
-
-            {
-
-                "type": "file_upload",
-
-                "status": "completed",
-
-                "job_name": job_name,
-
-                "dataset_name": dataset_display_name,
-
-                "dataset_path": dataset_path,
-
-                "onelake_path": onelake_path,
-
-                "job_id": job_id,
+                "file_path": dataset_path,
 
                 "rows": len(df),
 
-                "columns": len(df.columns)
+                "columns": list(df.columns),
+
+                "timestamp": (
+
+                    datetime.utcnow()
+                    .isoformat()
+                )
             }
-        )
 
-        # ==========================================
-        # ASSISTANT RESPONSE
-        # ==========================================
+            self.cosmos_service.save_create_dataset(
 
-        assistant_response = (
+                user_id,
 
-            "✅ Dataset uploaded successfully\n\n"
+                dataset_doc
+            )
 
-            f"Job Name: {job_name}\n\n"
+            print(
+                "✅ Saved to Cosmos"
+            )
 
-            "Dataset Details:\n"
+            # ==========================================
+            # ATTACH DATASET TO THREAD
+            # ==========================================
 
-            f"- Rows: {len(df)}\n"
+            self.thread_service.attach_dataset(
 
-            f"- Columns: {len(df.columns)}\n\n"
+                thread_id,
 
-            "Suggested Next Actions:\n"
+                dataset_info
+            )
 
-            "- Run ETL\n"
+            # ==========================================
+            # SAVE USER MESSAGE
+            # ==========================================
 
-            "- Apply DQ Rules\n"
+            self.thread_service.add_message(
 
-            "- Apply Business Logic\n"
+                thread_id=thread_id,
 
-            "- Run NER\n"
+                role="user",
 
-            "- Generate Dashboard\n"
-
-            "- Build AutoML Model"
-        )
-
-        # ==========================================
-        # SAVE ASSISTANT MESSAGE
-        # ==========================================
-
-        self.thread_service.add_message(
-
-            thread_id=thread_id,
-
-            role="assistant",
-
-            content=assistant_response,
-
-            message_type="completion",
-
-            metadata={
-
-                "dataset": dataset_info
-            }
-        )
-
-        # ==========================================
-        # UPDATE THREAD CONTEXT
-        # ==========================================
-
-        self.thread_service.update_context(
-
-            thread_id,
-
-            {
-
-                "job_name": job_name,
-
-                "selected_dataset": (
-                    dataset_info
+                content=(
+                    f"Uploaded dataset "
+                    f"{dataset_display_name}"
                 ),
 
-                "latest_dataset_path": (
-                    dataset_path
-                ),
+                message_type="dataset"
+            )
 
+            # ==========================================
+            # ASSISTANT RESPONSE
+            # ==========================================
+
+            assistant_response = (
+
+                "✅ Dataset uploaded successfully\n\n"
+
+                f"Job Name: {job_name}\n\n"
+
+                "Dataset Details:\n"
+
+                f"- Rows: {len(df)}\n"
+
+                f"- Columns: {len(df.columns)}\n\n"
+
+            )
+
+            # ==========================================
+            # SAVE ASSISTANT MESSAGE
+            # ==========================================
+
+            self.thread_service.add_message(
+
+                thread_id=thread_id,
+
+                role="assistant",
+
+                content=assistant_response,
+
+                message_type="completion",
+
+                metadata={
+
+                    "dataset": dataset_info
+                }
+            )
+
+            # ==========================================
+            # UPDATE THREAD CONTEXT
+            # ==========================================
+
+            self.thread_service.update_context(
+
+                thread_id,
+
+                {
+
+                    "job_name": job_name,
+
+                    "selected_dataset": (
+                        dataset_info
+                    ),
+
+                    "latest_dataset_path": (
+                        dataset_path
+                    ),
+
+                }
+            )
+
+            upload_response = {
+
+                "success": True,
+
+                "job": {
+
+                    "job_id": job_id,
+
+                    "job_name": job_name,
+
+                    "thread_id": thread_id,
+
+                    "session_id": session_id,
+
+                    "status": "completed",
+
+                    "created_at": doc["created_at"]
+                },
+
+                "dataset": {
+
+                    "dataset_name":
+                        dataset_display_name,
+
+                    "blob_path":
+                        dataset_path,
+
+                    "onelake_path":
+                        onelake_path,
+
+                    "source":
+                        "upload",
+
+                    "rows":
+                        len(df),
+
+                    "columns":
+                        len(df.columns),
+
+                    "column_names":
+                        list(df.columns),
+
+                    "sheet_name":
+                        selected_sheet
+                },
+
+                "automl": {
+
+                    "registered":
+                        automl_registered,
+
+                    "response":
+                        automl_response
+                },
+
+                "next_actions": [
+
+                    {
+                        "id": "dq",
+                        "label": "Apply Data Quality Rules"
+                    },
+
+                    {
+                        "id": "business_logic",
+                        "label": "Apply Business Logic"
+                    },
+
+                    {
+                        "id": "ner",
+                        "label": "Apply Name Entity Resolution"
+                    },
+
+                    {
+                        "id": "dashboard",
+                        "label": "Generate PowerBI Dashboard"
+                    },
+
+                    {
+                        "id": "automl",
+                        "label": "Build AutoML Model"
+                    }
+                ]
             }
-        )
 
-        # ==========================================
-        # RESPONSE
-        # ==========================================
+            self.thread_service.add_action(
 
-        return {
+                thread_id=thread_id,
 
-            "success": True,
+                role="assistant",
 
-            "job_id": job_id,
+                action_type="dataset_upload",
 
-            "job_name": job_name,
+                status="completed",
 
-            "thread_id": thread_id,
+                request={
 
-            "session_id": session_id,
+                    "filename":
+                        file.filename,
 
-            "response": assistant_response,
+                    "sheet_name":
+                        selected_sheet,
 
-            "data": doc,
+                    "user_id":
+                        user_id,
 
-            "dataset": dataset_info,
+                    "job_id":
+                        job_id
+                },
 
-            "next_actions": [
+                response=upload_response
+            )
 
-                "Apply Data Quality Rules",
 
-                " Apply Business Logic",
+            # ==========================================
+            # RESPONSE
+            # ==========================================
 
-                "Apply Name Entity Resolution",
+            return upload_response
+        
+        except Exception as e:
 
-                "Generate Power BI Dashboard",
+                error_response = {
 
-                "Build Automl Model"
-            ]
-        }
+                    "status": "failed",
+
+                    "error": str(e),
+
+                    "job_id": job_id,
+
+                    "thread_id": thread_id,
+
+                    "filename": file.filename
+                }
+
+                try:
+
+                    self.thread_service.add_message(
+
+                        thread_id=thread_id,
+
+                        role="assistant",
+
+                        content=str(e),
+
+                        message_type="error"
+                    )
+
+                    self.thread_service.add_action(
+
+                        thread_id=thread_id,
+
+                        role="assistant",
+
+                        action_type="dataset_upload",
+
+                        status="failed",
+
+                        request={
+
+                            "filename":
+                                file.filename,
+
+                             "sheet_name":
+                                sheet_name,
+
+                            "job_id":
+                                job_id,
+                            
+                        },
+
+                        response=error_response
+                    )
+
+                except Exception:
+                    pass
+
+                raise
