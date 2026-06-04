@@ -3348,6 +3348,9 @@ async def chat(req: ChatRequest):
 
                     request={
 
+                        "prompt":
+                           req.message,
+
                         "message": req.message
                     },
 
@@ -3455,8 +3458,17 @@ async def chat(req: ChatRequest):
 
                 request={
 
+                    "prompt":
+                        req.message,
+
                     "dataset":
-                        dataset["blob_path"]
+                        dataset["blob_path"],
+
+                    "job_id":
+                        req.job_id,
+
+                    "user_id":
+                        req.user_id
                 },
 
                 response=response
@@ -3495,6 +3507,9 @@ async def chat(req: ChatRequest):
                     status="failed",
 
                     request={
+
+                        "prompt":
+                           req.message,
                         "message": req.message
                     },
 
@@ -3593,8 +3608,17 @@ async def chat(req: ChatRequest):
 
                 request={
 
+                    "prompt":
+                        req.message,
+
                     "dataset":
-                        dataset["blob_path"]
+                        dataset["blob_path"],
+
+                    "job_id":
+                        req.job_id,
+
+                    "user_id":
+                        req.user_id
                 },
 
                 response=response
@@ -3634,6 +3658,7 @@ async def chat(req: ChatRequest):
                     status="failed",
 
                     request={
+
                         "message": req.message
                     },
 
@@ -3822,8 +3847,17 @@ async def chat(req: ChatRequest):
 
                 request={
 
+                    "prompt":
+                        req.message,
+
                     "dataset":
-                        dataset["blob_path"]
+                        dataset["blob_path"],
+
+                    "job_id":
+                        req.job_id,
+
+                    "user_id":
+                        req.user_id
                 },
 
                 response=response
@@ -4009,7 +4043,6 @@ async def chat(req: ChatRequest):
 
             detail=str(e)
         )
-
 
 # =========================
 # PIPELINES
