@@ -325,7 +325,7 @@ class ThreadService:
 
             "action_id": str(uuid.uuid4()),
 
-            "type": action_type,
+            "action_type": action_type,
 
             "status": status,
 
