@@ -2868,6 +2868,25 @@ async def chat(req: ChatRequest):
                 req.selected_jobs
             )
 
+            thread_service.add_action(
+
+            thread_id=req.thread_id,
+
+            role="user",
+
+            action_type="pipeline_job_selection",
+
+            status="completed",
+
+            request={
+
+                "selected_jobs":
+                    req.selected_jobs
+            },
+
+            response={}
+        )
+
             pipeline_ctx["step"] = (
                 "pipeline_name"
             )
@@ -2902,7 +2921,8 @@ async def chat(req: ChatRequest):
                 status="waiting",
 
                 request={
-                    "step": "pipeline_name"
+                    "prompt":
+                        "Enter pipeline name"
                 },
 
                 response=pipeline_response
@@ -2924,12 +2944,31 @@ async def chat(req: ChatRequest):
 
             if step == "pipeline_name":
 
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="user",
+
+                    action_type="pipeline_name",
+
+                    status="completed",
+
+                    request={
+
+                        "pipeline_name":
+                            req.message
+                    },
+
+                    response={}
+                )
+
                 pipeline_ctx["pipeline_name"] = (
                     req.message
                 )
 
                 pipeline_ctx["step"] = (
-                    "frequency"
+                    "schedule_decision"
                 )
 
                 thread_service.update_context(
@@ -2945,24 +2984,217 @@ async def chat(req: ChatRequest):
                 pipeline_response = {
 
                     "status":
-                        "pipeline_frequency_required",
+                        "pipeline_schedule_decision_required",
 
                     "message":
-                        "Enter frequency: daily, weekly or monthly"
+                        "Do you want to schedule this pipeline? (yes/no)"
                 }
 
                 thread_service.add_action(
 
                     thread_id=req.thread_id,
 
-                    role = "assistant",
+                    role="assistant",
 
                     action_type="pipeline_wizard",
 
                     status="waiting",
 
                     request={
-                        "step": "frequency"
+
+                        "prompt":
+                            "Do you want to schedule this pipeline?"
+                    },
+
+                    response=pipeline_response
+                )
+
+                return pipeline_response
+            
+            # ==========================================
+            # SCHEDULE DECISION
+            # ==========================================
+
+            elif step == "schedule_decision":
+
+                decision = (
+                    req.message
+                    .strip()
+                    .lower()
+                )
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="user",
+
+                    action_type="pipeline_schedule_decision",
+
+                    status="completed",
+
+                    request={
+
+                        "decision":
+                            decision
+                    },
+
+                    response={}
+                )
+
+                if decision not in [
+                    "yes",
+                    "no"
+                ]:
+
+                    error_response = {
+
+                        "status": "failed",
+
+                        "message":
+                            "Please answer yes or no."
+                    }
+
+                    return error_response
+
+                # ======================================
+                # NO SCHEDULE
+                # ======================================
+
+                if decision == "no":
+
+                    pipeline_doc = {
+
+                        "pipeline_id":
+                            generate_pipeline_id(),
+
+                        "name":
+                            pipeline_ctx["pipeline_name"],
+
+                        "created_at":
+                            datetime.utcnow().isoformat() + "Z",
+
+                        "job_ids":
+                            pipeline_ctx["selected_jobs"],
+
+                        "status":
+                            "SUCCESS",
+
+                        "schedule": {
+
+                            "active":
+                                False
+                        }
+                    }
+
+                    cosmos_service.save_pipeline(
+
+                        req.user_id,
+
+                        pipeline_doc
+                    )
+
+                    thread_service.update_context(
+
+                        req.thread_id,
+
+                        {
+
+                            "pipeline_creation": {
+
+                                "active": False
+                            }
+                        }
+                    )
+
+                    pipeline_response = {
+
+                        "status":
+                            "success",
+
+                        "message":
+                            "Pipeline created successfully.",
+
+                        "pipeline_id":
+                            pipeline_doc["pipeline_id"],
+
+                        "pipeline":
+                            pipeline_doc
+                    }
+
+                    thread_service.add_action(
+
+                        thread_id=req.thread_id,
+
+                        role="assistant",
+
+                        action_type="pipeline",
+
+                        status="completed",
+
+                        request={
+
+                            "pipeline_name":
+                                pipeline_ctx["pipeline_name"],
+
+                            "selected_jobs":
+                                pipeline_ctx["selected_jobs"],
+
+                            "schedule":
+                                False
+                        },
+
+                        response=pipeline_response
+                    )
+
+                    return pipeline_response
+
+                # ======================================
+                # YES SCHEDULE
+                # ======================================
+
+                pipeline_ctx["step"] = (
+                    "schedule_details"
+                )
+
+                thread_service.update_context(
+
+                    req.thread_id,
+
+                    {
+
+                        "pipeline_creation":
+                            pipeline_ctx
+                    }
+                )
+
+                pipeline_response = {
+
+                    "status":
+                        "pipeline_schedule_details_required",
+
+                    "message":
+                        (
+                            "Enter frequency, start date and time.\n\n"
+                            "Example:\n"
+                            "daily, 2026-06-15, 09:00"
+                        )
+                }
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="assistant",
+
+                    action_type="pipeline_wizard",
+
+                    status="waiting",
+
+                    request={
+
+                        "prompt":
+                            "Enter frequency, start date and time"
                     },
 
                     response=pipeline_response
@@ -2971,157 +3203,113 @@ async def chat(req: ChatRequest):
                 return pipeline_response
 
             # ==========================================
-            # FREQUENCY
+            # SCHEDULE DETAILS
             # ==========================================
 
-            elif step == "frequency":
+            elif step == "schedule_details":
 
-                freq = (
-                    req.message
-                    .lower()
-                    .strip()
-                )
+                try:
 
-                if freq not in [
+                    parts = [
+
+                        p.strip()
+
+                        for p in req.message.split(",")
+                    ]
+
+                    if len(parts) != 3:
+
+                        raise Exception()
+
+                    frequency = parts[0]
+
+                    start_date = parts[1]
+
+                    time_utc = parts[2]
+
+                    if frequency not in [
                         "daily",
                         "weekly",
                         "monthly"
                     ]:
 
-                        error_response = {
+                        raise Exception()
 
-                            "status": "failed",
+                except Exception:
 
-                            "message":
-                                "Frequency must be daily, weekly or monthly."
-                        }
+                    error_response = {
 
-                        thread_service.add_action(
+                        "status": "failed",
 
-                            thread_id=req.thread_id,
+                        "message":
+                            "Format should be: daily, 2026-06-15, 09:00"
+                    }
 
-                            role="assistant",
+                    thread_service.add_action(
 
-                            action_type="pipeline_wizard",
+                        thread_id=req.thread_id,
 
-                            status="failed",
+                        role="assistant",
 
-                            request={
-                                "frequency": req.message
-                            },
+                        action_type="pipeline_wizard",
 
-                            response=error_response
-                        )
+                        status="failed",
 
-                        return error_response
+                        request={
+
+                            "schedule_input":
+                                req.message
+                        },
+
+                        response=error_response
+                    )
+
+                    return error_response
+
+                # ======================================
+                # STORE USER INPUT
+                # ======================================
+
+                thread_service.add_action(
+
+                    thread_id=req.thread_id,
+
+                    role="user",
+
+                    action_type="pipeline_schedule_details",
+
+                    status="completed",
+
+                    request={
+
+                        "frequency":
+                            frequency,
+
+                        "start_date":
+                            start_date,
+
+                        "time":
+                            time_utc
+                    },
+
+                    response={}
+                )
 
                 pipeline_ctx["frequency"] = (
-                    freq
+                    frequency
                 )
-
-                pipeline_ctx["step"] = (
-                    "start_date"
-                )
-
-                thread_service.update_context(
-
-                    req.thread_id,
-
-                    {
-                        "pipeline_creation":
-                            pipeline_ctx
-                    }
-                )
-
-                pipeline_response = {
-
-                    "status":
-                        "pipeline_start_date_required",
-
-                    "message":
-                        "Enter start date (YYYY-MM-DD)"
-                }
-
-                thread_service.add_action(
-
-                    thread_id=req.thread_id,
-
-                    role = "assistant",
-
-                    action_type="pipeline_wizard",
-
-                    status="waiting",
-
-                    request={
-                        "step": "start_date"
-                    },
-
-                    response=pipeline_response
-                )
-
-                return pipeline_response
-
-            # ==========================================
-            # START DATE
-            # ==========================================
-
-            elif step == "start_date":
 
                 pipeline_ctx["start_date"] = (
-                    req.message
+                    start_date
                 )
-
-                pipeline_ctx["step"] = (
-                    "time"
-                )
-
-                thread_service.update_context(
-
-                    req.thread_id,
-
-                    {
-                        "pipeline_creation":
-                            pipeline_ctx
-                    }
-                )
-
-                pipeline_response = {
-
-                    "status":
-                        "pipeline_time_required",
-
-                    "message":
-                        "Enter time (HH:MM)"
-                }
-
-                thread_service.add_action(
-
-                    thread_id=req.thread_id,
-
-                    role = "assistant",
-
-                    action_type="pipeline_wizard",
-
-                    status="waiting",
-
-                    request={
-                        "step": "time"
-                    },
-
-                    response=pipeline_response
-                )
-
-                return pipeline_response
-
-            # ==========================================
-            # TIME
-            # ==========================================
-
-            elif step == "time":
 
                 pipeline_ctx["time_utc"] = (
-                    req.message
+                    time_utc
                 )
+
+                # ======================================
+                # CREATE PIPELINE
+                # ======================================
 
                 pipeline_doc = {
 
@@ -3129,19 +3317,13 @@ async def chat(req: ChatRequest):
                         generate_pipeline_id(),
 
                     "name":
-                        pipeline_ctx[
-                            "pipeline_name"
-                        ],
+                        pipeline_ctx["pipeline_name"],
 
                     "created_at":
-                        datetime.utcnow()
-                        .isoformat()
-                        + "Z",
+                        datetime.utcnow().isoformat() + "Z",
 
                     "job_ids":
-                        pipeline_ctx[
-                            "selected_jobs"
-                        ],
+                        pipeline_ctx["selected_jobs"],
 
                     "status":
                         "SUCCESS",
@@ -3159,26 +3341,18 @@ async def chat(req: ChatRequest):
                         None,
 
                     "updated_at":
-                        datetime.utcnow()
-                        .isoformat()
-                        + "Z",
+                        datetime.utcnow().isoformat() + "Z",
 
                     "schedule": {
 
                         "frequency":
-                            pipeline_ctx[
-                                "frequency"
-                            ],
+                            frequency,
 
                         "time_utc":
-                            pipeline_ctx[
-                                "time_utc"
-                            ],
+                            time_utc,
 
                         "start_date":
-                            pipeline_ctx[
-                                "start_date"
-                            ],
+                            start_date,
 
                         "active":
                             True
@@ -3247,7 +3421,16 @@ async def chat(req: ChatRequest):
                             pipeline_ctx["pipeline_name"],
 
                         "selected_jobs":
-                            pipeline_ctx["selected_jobs"]
+                            pipeline_ctx["selected_jobs"],
+
+                        "frequency":
+                            frequency,
+
+                        "start_date":
+                            start_date,
+
+                        "time":
+                            time_utc
                     },
 
                     response=pipeline_response
@@ -3659,7 +3842,14 @@ async def chat(req: ChatRequest):
 
                     request={
 
-                        "message": req.message
+                        "prompt":
+                            req.message,
+
+                        "job_id":
+                            req.job_id,
+
+                        "user_id":
+                            req.user_id
                     },
 
                     response=error_response
@@ -3899,7 +4089,7 @@ async def chat(req: ChatRequest):
                     status="failed",
 
                     request={
-                        "message": req.message
+                        "prompt": req.message
                     },
 
                     response=error_response
@@ -3958,7 +4148,8 @@ async def chat(req: ChatRequest):
                 status="waiting",
 
                 request={
-                    "step": "select_jobs"
+                     "prompt":
+                         "Select jobs for pipeline creation"
                 },
 
                 response=pipeline_response
@@ -3989,7 +4180,7 @@ async def chat(req: ChatRequest):
             status="failed",
 
             request={
-                "message": req.message
+                "prompt": req.message
             },
 
             response=error_response
@@ -4026,7 +4217,7 @@ async def chat(req: ChatRequest):
             status="failed",
 
             request={
-                "message": req.message
+                "prompt": req.message
             },
 
             response={
