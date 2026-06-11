@@ -2799,13 +2799,9 @@ async def chat(req: ChatRequest):
         # ==========================================
 
         thread_service.add_message(
-
             thread_id=req.thread_id,
-
             role="user",
-
             content=req.message,
-
             message_type="text",
         )
 
@@ -2813,42 +2809,27 @@ async def chat(req: ChatRequest):
         # LOAD THREAD
         # ==========================================
 
-        thread = thread_service.load_thread(
-            req.thread_id
-        )
+        thread = thread_service.load_thread(req.thread_id)
 
         if not thread:
-
             raise HTTPException(
-
                 status_code=404,
-
                 detail="Thread not found"
             )
 
         context = thread["context"]
 
         print("\n========== THREAD DEBUG ==========")
-        print(
-            json.dumps(
-                context,
-                indent=2
-            )
-        )
+        print(json.dumps(context, indent=2))
         print("=================================\n")
+
         # =====================================================
         # PIPELINE FLOW
         # =====================================================
 
-        pipeline_ctx = context.get(
-            "pipeline_creation",
-            {}
-        )
+        pipeline_ctx = context.get("pipeline_creation", {})
 
-        print(
-            "PIPELINE STATE:",
-            pipeline_ctx
-        )
+        print("PIPELINE STATE:", pipeline_ctx)
 
         # =====================================================
         # STEP 0 - JOB SELECTION
@@ -2856,75 +2837,51 @@ async def chat(req: ChatRequest):
 
         if (
             pipeline_ctx.get("active")
-            and
-            pipeline_ctx.get("step") == "select_jobs"
-            and
-            req.selected_jobs
-            and
-            len(req.selected_jobs) > 0
+            and pipeline_ctx.get("step") == "select_jobs"
+            and req.selected_jobs
+            and len(req.selected_jobs) > 0
         ):
+            available_jobs = pipeline_ctx.get("available_jobs", [])
 
-            pipeline_ctx["selected_jobs"] = (
-                req.selected_jobs
-            )
+            selected_job_details = [
+                {
+                    "job_id": job["job_id"],
+                    "job_name": job.get("job_name")
+                }
+                for job in available_jobs
+                if job["job_id"] in req.selected_jobs
+            ]
+
+            pipeline_ctx["selected_jobs"] = req.selected_jobs
+            pipeline_ctx["selected_job_details"] = selected_job_details
 
             thread_service.add_action(
-
-            thread_id=req.thread_id,
-
-            role="user",
-
-            action_type="pipeline_job_selection",
-
-            status="completed",
-
-            request={
-
-                "selected_jobs":
-                    req.selected_jobs
-            },
-
-            response={}
-        )
-
-            pipeline_ctx["step"] = (
-                "pipeline_name"
+                thread_id=req.thread_id,
+                role="user",
+                action_type="pipeline_job_selection",
+                status="completed",
+                request={"selected_jobs": selected_job_details},
+                response={}
             )
 
+            pipeline_ctx["step"] = "pipeline_name"
+
             thread_service.update_context(
-
                 req.thread_id,
-
-                {
-                    "pipeline_creation":
-                        pipeline_ctx
-                }
+                {"pipeline_creation": pipeline_ctx}
             )
 
             pipeline_response = {
-
-                "status":
-                    "pipeline_name_required",
-
-                "message":
-                    "Enter pipeline name."
+                "status": "pipeline_name_required",
+                "message": "Enter pipeline name."
             }
 
             thread_service.add_action(
-
                 thread_id=req.thread_id,
-
-                role = "assistant",
-
+                role="assistant",
                 action_type="pipeline_wizard",
-
                 status="waiting",
-
-                request={
-                    "prompt":
-                        "Enter pipeline name"
-                },
-
+                request={"prompt": "Enter pipeline name"},
                 response=pipeline_response
             )
 
@@ -2945,116 +2902,60 @@ async def chat(req: ChatRequest):
             if step == "pipeline_name":
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="user",
-
                     action_type="pipeline_name",
-
                     status="completed",
-
-                    request={
-
-                        "pipeline_name":
-                            req.message
-                    },
-
+                    request={"pipeline_name": req.message},
                     response={}
                 )
 
-                pipeline_ctx["pipeline_name"] = (
-                    req.message
-                )
-
-                pipeline_ctx["step"] = (
-                    "schedule_decision"
-                )
+                pipeline_ctx["pipeline_name"] = req.message
+                pipeline_ctx["step"] = "schedule_decision"
 
                 thread_service.update_context(
-
                     req.thread_id,
-
-                    {
-                        "pipeline_creation":
-                            pipeline_ctx
-                    }
+                    {"pipeline_creation": pipeline_ctx}
                 )
 
                 pipeline_response = {
-
-                    "status":
-                        "pipeline_schedule_decision_required",
-
-                    "message":
-                        "Do you want to schedule this pipeline? (yes/no)"
+                    "status": "pipeline_schedule_decision_required",
+                    "message": "Do you want to schedule this pipeline? (yes/no)"
                 }
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="pipeline_wizard",
-
                     status="waiting",
-
-                    request={
-
-                        "prompt":
-                            "Do you want to schedule this pipeline?"
-                    },
-
+                    request={"prompt": "Do you want to schedule this pipeline?"},
                     response=pipeline_response
                 )
 
                 return pipeline_response
-            
+
             # ==========================================
             # SCHEDULE DECISION
             # ==========================================
 
             elif step == "schedule_decision":
 
-                decision = (
-                    req.message
-                    .strip()
-                    .lower()
-                )
+                decision = req.message.strip().lower()
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="user",
-
                     action_type="pipeline_schedule_decision",
-
                     status="completed",
-
-                    request={
-
-                        "decision":
-                            decision
-                    },
-
+                    request={"decision": decision},
                     response={}
                 )
 
-                if decision not in [
-                    "yes",
-                    "no"
-                ]:
-
+                if decision not in ["yes", "no"]:
                     error_response = {
-
                         "status": "failed",
-
-                        "message":
-                            "Please answer yes or no."
+                        "message": "Please answer yes or no."
                     }
-
                     return error_response
 
                 # ======================================
@@ -3064,88 +2965,63 @@ async def chat(req: ChatRequest):
                 if decision == "no":
 
                     pipeline_doc = {
-
-                        "pipeline_id":
-                            generate_pipeline_id(),
-
-                        "name":
-                            pipeline_ctx["pipeline_name"],
-
-                        "created_at":
-                            datetime.utcnow().isoformat() + "Z",
-
-                        "job_ids":
-                            pipeline_ctx["selected_jobs"],
-
-                        "status":
-                            "SUCCESS",
-
+                        "pipeline_id": generate_pipeline_id(),
+                        "name": pipeline_ctx["pipeline_name"],
+                        "created_at": datetime.utcnow().isoformat() + "Z",
+                        "job_ids": pipeline_ctx["selected_job_details"],
+                        "status": "SUCCESS",
                         "schedule": {
-
-                            "active":
-                                False
+                            "active": False
                         }
                     }
 
-                    cosmos_service.save_pipeline(
-
-                        req.user_id,
-
-                        pipeline_doc
-                    )
+                    cosmos_service.save_pipeline(req.user_id, pipeline_doc)
 
                     thread_service.update_context(
-
                         req.thread_id,
-
-                        {
-
-                            "pipeline_creation": {
-
-                                "active": False
-                            }
-                        }
+                        {"pipeline_creation": {"active": False}}
                     )
 
                     pipeline_response = {
-
-                        "status":
-                            "success",
-
-                        "message":
-                            "Pipeline created successfully.",
-
-                        "pipeline_id":
-                            pipeline_doc["pipeline_id"],
-
-                        "pipeline":
-                            pipeline_doc
+                        "status": "success",
+                        "message": "Pipeline created successfully.",
+                        "pipeline_id": pipeline_doc["pipeline_id"],
+                         "selected_jobs": pipeline_ctx.get(
+                            "selected_job_details",
+                            []
+                        ),
+                        "pipeline": pipeline_doc
                     }
 
                     thread_service.add_action(
+                        thread_id=req.thread_id,
+                        role="assistant",
+                        action_type="pipeline",
+                        status="completed",
+                        request={
+                            "pipeline_name": pipeline_ctx["pipeline_name"],
+                            "selected_jobs":
+                                pipeline_ctx.get(
+                                    "selected_job_details",
+                                    []
+                                ),
+                            "schedule": False
+                        },
+                        response=pipeline_response
+                    )
+
+                    thread_service.add_message(
 
                         thread_id=req.thread_id,
 
                         role="assistant",
 
-                        action_type="pipeline",
+                        content="Pipeline created successfully.",
 
-                        status="completed",
+                        message_type="completion",
 
-                        request={
-
-                            "pipeline_name":
-                                pipeline_ctx["pipeline_name"],
-
-                            "selected_jobs":
-                                pipeline_ctx["selected_jobs"],
-
-                            "schedule":
-                                False
-                        },
-
-                        response=pipeline_response
-                    )
+                        metadata=pipeline_response
+                )
 
                     return pipeline_response
 
@@ -3153,50 +3029,28 @@ async def chat(req: ChatRequest):
                 # YES SCHEDULE
                 # ======================================
 
-                pipeline_ctx["step"] = (
-                    "schedule_details"
-                )
+                pipeline_ctx["step"] = "schedule_details"
 
                 thread_service.update_context(
-
                     req.thread_id,
-
-                    {
-
-                        "pipeline_creation":
-                            pipeline_ctx
-                    }
+                    {"pipeline_creation": pipeline_ctx}
                 )
 
                 pipeline_response = {
-
-                    "status":
-                        "pipeline_schedule_details_required",
-
-                    "message":
-                        (
-                            "Enter frequency, start date and time.\n\n"
-                            "Example:\n"
-                            "daily, 2026-06-15, 09:00"
-                        )
+                    "status": "pipeline_schedule_details_required",
+                    "message": (
+                        "Enter frequency, start date and time.\n\n"
+                        "Example:\n"
+                        "daily, 2026-06-15, 09:00"
+                    )
                 }
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="pipeline_wizard",
-
                     status="waiting",
-
-                    request={
-
-                        "prompt":
-                            "Enter frequency, start date and time"
-                    },
-
+                    request={"prompt": "Enter frequency, start date and time"},
                     response=pipeline_response
                 )
 
@@ -3209,58 +3063,30 @@ async def chat(req: ChatRequest):
             elif step == "schedule_details":
 
                 try:
-
-                    parts = [
-
-                        p.strip()
-
-                        for p in req.message.split(",")
-                    ]
+                    parts = [p.strip() for p in req.message.split(",")]
 
                     if len(parts) != 3:
-
                         raise Exception()
 
                     frequency = parts[0]
-
                     start_date = parts[1]
-
                     time_utc = parts[2]
 
-                    if frequency not in [
-                        "daily",
-                        "weekly",
-                        "monthly"
-                    ]:
-
+                    if frequency not in ["daily", "weekly", "monthly"]:
                         raise Exception()
 
                 except Exception:
-
                     error_response = {
-
                         "status": "failed",
-
-                        "message":
-                            "Format should be: daily, 2026-06-15, 09:00"
+                        "message": "Format should be: daily, 2026-06-15, 09:00"
                     }
 
                     thread_service.add_action(
-
                         thread_id=req.thread_id,
-
                         role="assistant",
-
                         action_type="pipeline_wizard",
-
                         status="failed",
-
-                        request={
-
-                            "schedule_input":
-                                req.message
-                        },
-
+                        request={"schedule_input": req.message},
                         response=error_response
                     )
 
@@ -3271,195 +3097,93 @@ async def chat(req: ChatRequest):
                 # ======================================
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="user",
-
                     action_type="pipeline_schedule_details",
-
                     status="completed",
-
                     request={
-
-                        "frequency":
-                            frequency,
-
-                        "start_date":
-                            start_date,
-
-                        "time":
-                            time_utc
+                        "frequency": frequency,
+                        "start_date": start_date,
+                        "time": time_utc
                     },
-
                     response={}
                 )
 
-                pipeline_ctx["frequency"] = (
-                    frequency
-                )
-
-                pipeline_ctx["start_date"] = (
-                    start_date
-                )
-
-                pipeline_ctx["time_utc"] = (
-                    time_utc
-                )
+                pipeline_ctx["frequency"] = frequency
+                pipeline_ctx["start_date"] = start_date
+                pipeline_ctx["time_utc"] = time_utc
 
                 # ======================================
                 # CREATE PIPELINE
                 # ======================================
 
                 pipeline_doc = {
-
-                    "pipeline_id":
-                        generate_pipeline_id(),
-
-                    "name":
-                        pipeline_ctx["pipeline_name"],
-
-                    "created_at":
-                        datetime.utcnow().isoformat() + "Z",
-
-                    "job_ids":
-                        pipeline_ctx["selected_jobs"],
-
-                    "status":
-                        "SUCCESS",
-
-                    "last_run":
-                        None,
-
-                    "description":
-                        "",
-
-                    "last_run_started_at":
-                        None,
-
-                    "last_run_result":
-                        None,
-
-                    "updated_at":
-                        datetime.utcnow().isoformat() + "Z",
-
+                    "pipeline_id": generate_pipeline_id(),
+                    "name": pipeline_ctx["pipeline_name"],
+                    "created_at": datetime.utcnow().isoformat() + "Z",
+                    "job_ids": pipeline_ctx["selected_job_details"],
+                    "status": "SUCCESS",
+                    "last_run": None,
+                    "description": "",
+                    "last_run_started_at": None,
+                    "last_run_result": None,
+                    "updated_at": datetime.utcnow().isoformat() + "Z",
                     "schedule": {
-
-                        "frequency":
-                            frequency,
-
-                        "time_utc":
-                            time_utc,
-
-                        "start_date":
-                            start_date,
-
-                        "active":
-                            True
+                        "frequency": frequency,
+                        "time_utc": time_utc,
+                        "start_date": start_date,
+                        "active": True
                     }
                 }
 
-                cosmos_service.save_pipeline(
-
-                    req.user_id,
-
-                    pipeline_doc
-                )
+                cosmos_service.save_pipeline(req.user_id, pipeline_doc)
 
                 thread_service.update_context(
-
                     req.thread_id,
-
-                    {
-
-                        "pipeline_creation": {
-
-                            "active": False
-                        }
-                    }
+                    {"pipeline_creation": {"active": False}}
                 )
 
                 pipeline_response = {
-
-                    "status":
-                        "success",
-
-                    "message":
-                        "Pipeline created successfully.",
-
-                    "pipeline_id":
-                        pipeline_doc["pipeline_id"],
-
-                    "pipeline":
-                        pipeline_doc,
-
-                    "next_actions": [
-
-                        {
-                            "action":
-                                "view_pipeline",
-
-                            "label":
-                                "View Pipeline"
-                        }
-                    ]
+                    "status": "success",
+                    "message": "Pipeline created successfully.",
+                    "pipeline_id": pipeline_doc["pipeline_id"],
+                    "pipeline": pipeline_doc,
+                    "selected_jobs": pipeline_ctx.get(
+                        "selected_job_details",
+                        []
+                    ),
                 }
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="pipeline",
-
                     status="completed",
-
                     request={
-
-                        "pipeline_name":
-                            pipeline_ctx["pipeline_name"],
-
-                        "selected_jobs":
-                            pipeline_ctx["selected_jobs"],
-
-                        "frequency":
-                            frequency,
-
-                        "start_date":
-                            start_date,
-
-                        "time":
-                            time_utc
+                        "pipeline_name": pipeline_ctx["pipeline_name"],
+                        "selected_jobs": pipeline_ctx.get("selected_job_details", []),
+                        "frequency": frequency,
+                        "start_date": start_date,
+                        "time": time_utc
                     },
-
                     response=pipeline_response
                 )
 
                 thread_service.add_message(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     content="Pipeline created successfully.",
-
                     message_type="completion",
-
                     metadata=pipeline_response
                 )
 
                 return pipeline_response
+
         # ==========================================
         # DETECT INTENT
         # ==========================================
 
-        result = orchestrator.detect_intent(
-
-            req.message,
-
-            context
-        )
+        result = orchestrator.detect_intent(req.message, context)
 
         # ==========================================
         # CONVERSATION
@@ -3468,35 +3192,23 @@ async def chat(req: ChatRequest):
         if result["type"] == "conversation":
 
             thread_service.add_message(
-
                 thread_id=req.thread_id,
-
                 role="assistant",
-
                 content=result["response"],
-
                 message_type="text",
             )
 
             thread_service.add_action(
-
                 thread_id=req.thread_id,
-
                 role="assistant",
-
                 action_type="conversation",
-
                 status="completed",
-
-                request={
-                    "message": req.message
-                },
-
+                request={"message": req.message},
                 response=result
             )
 
             return result
-        
+
         intent = result["intent"]
 
         # =====================================================
@@ -3505,155 +3217,78 @@ async def chat(req: ChatRequest):
 
         if intent == "dq":
 
-            dataset = context.get(
-                "selected_dataset"
-            )
+            dataset = context.get("selected_dataset")
 
             if not dataset:
-
                 error_response = {
-
                     "status": "failed",
-
-                    "message":
-                        "Please upload dataset first"
+                    "message": "Please upload dataset first"
                 }
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="dq",
-
                     status="failed",
-
                     request={
-
-                        "prompt":
-                           req.message,
-
+                        "prompt": req.message,
                         "message": req.message
                     },
-
                     response=error_response
                 )
 
                 return error_response
 
-            response = dq_service.run(
-                dataset["blob_path"]
-            )
+            response = dq_service.run(dataset["blob_path"])
 
-            job_doc = cosmos_service.get_dataset(
-
-                req.user_id,
-
-                req.job_id
-            )
+            job_doc = cosmos_service.get_dataset(req.user_id, req.job_id)
 
             if job_doc:
-
                 job_doc["dq"] = True
-
-                cosmos_service.update_dataset(
-
-                    req.user_id,
-
-                    job_doc
-                )
+                cosmos_service.update_dataset(req.user_id, job_doc)
 
             thread_service.update_context(
-
                 req.thread_id,
-
                 {
-
                     "dq_completed": True,
-
                     "selected_dataset": {
-
                         **dataset,
-
                         "dq_applied": True
                     }
                 },
             )
 
             thread_service.add_message(
-
                 thread_id=req.thread_id,
-
                 role="assistant",
-
                 content=(
-
                     f"DQ completed successfully.\n\n"
-
-                    f"Rules Applied: "
-                    f"{response['rules_applied']}\n"
-
-                    f"Issues Before: "
-                    f"{len(response['issues_before'])}\n"
-
-                    f"Issues After: "
-                    f"{len(response['issues_after'])}"
+                    f"Rules Applied: {response['rules_applied']}\n"
+                    f"Issues Before: {len(response['issues_before'])}\n"
+                    f"Issues After: {len(response['issues_after'])}"
                 ),
-
                 message_type="completion",
-
                 metadata=response,
             )
 
             response["next_actions"] = [
-
-                {
-                    "action": "ner",
-                    "label": "Run Name Entity Resolution"
-                },
-
-                {
-                    "action": "business_logic",
-                    "label": "Apply Business Logic"
-                },
-
-                {
-                    "action": "dashboard",
-                    "label": "Generate Power BI Dashboard"
-                },
-
-                {
-                    "action": "automl",
-                    "label": "Build AutoML Model"
-                }
+                {"action": "ner", "label": "Run Name Entity Resolution"},
+                {"action": "business_logic", "label": "Apply Business Logic"},
+                {"action": "dashboard", "label": "Generate Power BI Dashboard"},
+                {"action": "automl", "label": "Build AutoML Model"}
             ]
 
             thread_service.add_action(
-
                 thread_id=req.thread_id,
-
                 role="assistant",
-
                 action_type="dq",
-
                 status="completed",
-
                 request={
-
-                    "prompt":
-                        req.message,
-
-                    "dataset":
-                        dataset["blob_path"],
-
-                    "job_id":
-                        req.job_id,
-
-                    "user_id":
-                        req.user_id
+                    "prompt": req.message,
+                    "dataset": dataset["blob_path"],
+                    "job_id": req.job_id,
+                    "user_id": req.user_id
                 },
-
                 response=response
             )
 
@@ -3665,145 +3300,73 @@ async def chat(req: ChatRequest):
 
         elif intent == "ner":
 
-            dataset = context.get(
-                "selected_dataset"
-            )
+            dataset = context.get("selected_dataset")
 
             if not dataset:
-
                 error_response = {
-
                     "status": "failed",
-
-                    "message":
-                        "Please upload or attach dataset first."
+                    "message": "Please upload or attach dataset first."
                 }
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="ner",
-
                     status="failed",
-
                     request={
-
-                        "prompt":
-                           req.message,
+                        "prompt": req.message,
                         "message": req.message
                     },
-
                     response=error_response
                 )
 
                 return error_response
 
-            response = ner_service.run(
-                dataset["blob_path"]
-            )
+            response = ner_service.run(dataset["blob_path"])
 
-            job_doc = cosmos_service.get_dataset(
-
-                req.user_id,
-
-                req.job_id
-            )
+            job_doc = cosmos_service.get_dataset(req.user_id, req.job_id)
 
             if job_doc:
-
                 job_doc["ner"] = True
-
-                cosmos_service.update_dataset(
-
-                    req.user_id,
-
-                    job_doc
-                )
+                cosmos_service.update_dataset(req.user_id, job_doc)
 
             thread_service.update_context(
-
                 req.thread_id,
-
                 {
-
                     "ner_completed": True,
-
                     "selected_dataset": {
-
                         **dataset,
-
                         "ner_applied": True,
-
-                        "entity_columns": (
-
-                            response.get(
-                                "entity_columns_created",
-                                []
-                            )
-                        ),
+                        "entity_columns": response.get("entity_columns_created", []),
                     },
                 },
             )
 
             thread_service.add_message(
-
                 thread_id=req.thread_id,
-
                 role="assistant",
-
                 content="NER completed successfully",
-
                 message_type="completion",
-
                 metadata=response,
             )
 
             response["next_actions"] = [
-
-                {
-                    "action": "business_logic",
-                    "label": "Apply Business Logic"
-                },
-
-                {
-                    "action": "dashboard",
-                    "label": "Generate Power BI Dashboard"
-                },
-
-                {
-                    "action": "automl",
-                    "label": "Build AutoML Model"
-                }
+                {"action": "business_logic", "label": "Apply Business Logic"},
+                {"action": "dashboard", "label": "Generate Power BI Dashboard"},
+                {"action": "automl", "label": "Build AutoML Model"}
             ]
 
             thread_service.add_action(
-
                 thread_id=req.thread_id,
-
                 role="assistant",
-
                 action_type="ner",
-
                 status="completed",
-
                 request={
-
-                    "prompt":
-                        req.message,
-
-                    "dataset":
-                        dataset["blob_path"],
-
-                    "job_id":
-                        req.job_id,
-
-                    "user_id":
-                        req.user_id
+                    "prompt": req.message,
+                    "dataset": dataset["blob_path"],
+                    "job_id": req.job_id,
+                    "user_id": req.user_id
                 },
-
                 response=response
             )
 
@@ -3813,45 +3376,26 @@ async def chat(req: ChatRequest):
         # BUSINESS LOGIC
         # =====================================================
 
-
         elif intent == "business_logic":
 
-            dataset = context.get(
-                "selected_dataset"
-            )
+            dataset = context.get("selected_dataset")
 
             if not dataset:
-
                 error_response = {
-
                     "status": "failed",
-
-                    "message":
-                        "Please upload or generate dataset first."
+                    "message": "Please upload or generate dataset first."
                 }
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="business_logic",
-
                     status="failed",
-
                     request={
-
-                        "prompt":
-                            req.message,
-
-                        "job_id":
-                            req.job_id,
-
-                        "user_id":
-                            req.user_id
+                        "prompt": req.message,
+                        "job_id": req.job_id,
+                        "user_id": req.user_id
                     },
-
                     response=error_response
                 )
 
@@ -3861,42 +3405,24 @@ async def chat(req: ChatRequest):
             # RUN BUSINESS LOGIC
             # ==========================================
 
-            response = business_logic_service.run(
-
-                blob_path=dataset["blob_path"]
-            )
+            response = business_logic_service.run(blob_path=dataset["blob_path"])
 
             if response["status"] == "warning":
 
                 thread_service.add_message(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     content=response["message"],
-
                     message_type="warning",
-
                     metadata=response
                 )
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="business_logic",
-
                     status="completed",
-
-                    request={
-
-                        "dataset":
-                            dataset["blob_path"]
-                    },
-
+                    request={"dataset": dataset["blob_path"]},
                     response=response
                 )
 
@@ -3906,69 +3432,27 @@ async def chat(req: ChatRequest):
             # UPDATE COSMOS
             # ==========================================
 
-            job_doc = cosmos_service.get_dataset(
-
-                req.user_id,
-
-                req.job_id
-            )
+            job_doc = cosmos_service.get_dataset(req.user_id, req.job_id)
 
             if job_doc:
-
                 job_doc["business_logic"] = True
-
-                job_doc["business_rules"] = (
-                    response.get(
-                        "generated_rules",
-                        []
-                    )
-                )
-
-                job_doc["generated_columns"] = (
-                    response.get(
-                        "generated_columns",
-                        []
-                    )
-                )
-
-                cosmos_service.update_dataset(
-
-                    req.user_id,
-
-                    job_doc
-                )
+                job_doc["business_rules"] = response.get("generated_rules", [])
+                job_doc["generated_columns"] = response.get("generated_columns", [])
+                cosmos_service.update_dataset(req.user_id, job_doc)
 
             # ==========================================
             # UPDATE THREAD CONTEXT
             # ==========================================
 
             thread_service.update_context(
-
                 req.thread_id,
-
                 {
-
                     "business_logic_completed": True,
-
                     "selected_dataset": {
-
                         **dataset,
-
                         "business_logic_applied": True,
-
-                        "generated_columns": (
-                            response.get(
-                                "generated_columns",
-                                []
-                            )
-                        ),
-
-                        "generated_rules": (
-                            response.get(
-                                "generated_rules",
-                                []
-                            )
-                        )
+                        "generated_columns": response.get("generated_columns", []),
+                        "generated_rules": response.get("generated_rules", [])
                     },
                 },
             )
@@ -3978,33 +3462,17 @@ async def chat(req: ChatRequest):
             # ==========================================
 
             thread_service.add_message(
-
                 thread_id=req.thread_id,
-
                 role="assistant",
-
                 content=(
-
                     f"Business Logic applied successfully.\n\n"
-
-                    f"AI Rules Generated: "
-                    f"{response['rules_received']}\n"
-
-                    f"Rules Applied: "
-                    f"{response['rules_applied']}\n"
-
-                    f"Generated Features: "
-                    f"{len(response['generated_columns'])}\n"
-
-                    f"Rows: "
-                    f"{response['rows']}\n"
-
-                    f"Columns: "
-                    f"{response['columns']}"
+                    f"AI Rules Generated: {response['rules_received']}\n"
+                    f"Rules Applied: {response['rules_applied']}\n"
+                    f"Generated Features: {len(response['generated_columns'])}\n"
+                    f"Rows: {response['rows']}\n"
+                    f"Columns: {response['columns']}"
                 ),
-
                 message_type="completion",
-
                 metadata=response,
             )
 
@@ -4013,145 +3481,78 @@ async def chat(req: ChatRequest):
             # ==========================================
 
             response["next_actions"] = [
-
-                {
-                    "action": "dashboard",
-                    "label": "Generate Power BI Dashboard"
-                },
-
-                {
-                    "action": "automl",
-                    "label": "Build AutoML Model"
-                }
+                {"action": "dashboard", "label": "Generate Power BI Dashboard"},
+                {"action": "automl", "label": "Build AutoML Model"}
             ]
 
             thread_service.add_action(
-
                 thread_id=req.thread_id,
-
-                role = "assistant",
-
+                role="assistant",
                 action_type="business_logic",
-
                 status="completed",
-
                 request={
-
-                    "prompt":
-                        req.message,
-
-                    "dataset":
-                        dataset["blob_path"],
-
-                    "job_id":
-                        req.job_id,
-
-                    "user_id":
-                        req.user_id
+                    "prompt": req.message,
+                    "dataset": dataset["blob_path"],
+                    "job_id": req.job_id,
+                    "user_id": req.user_id
                 },
-
                 response=response
             )
 
             return response
-            
+
         # =====================================================
         # PIPELINE
         # =====================================================
 
         elif intent == "pipeline":
 
-            jobs = (
-                cosmos_service
-                .list_jobs_for_pipeline(
-                    req.user_id
-                )
-            )
+            jobs = cosmos_service.list_jobs_for_pipeline(req.user_id)
 
             if not jobs:
-
                 error_response = {
-
                     "status": "failed",
-
-                    "message":
-                        "No eligible jobs found."
+                    "message": "No eligible jobs found."
                 }
 
                 thread_service.add_action(
-
                     thread_id=req.thread_id,
-
                     role="assistant",
-
                     action_type="pipeline",
-
                     status="failed",
-
-                    request={
-                        "prompt": req.message
-                    },
-
+                    request={"prompt": req.message},
                     response=error_response
                 )
 
                 return error_response
 
             thread_service.update_context(
-
                 req.thread_id,
-
                 {
-
                     "pipeline_creation": {
-
                         "active": True,
-
-                        "step":
-                            "select_jobs",
-
-                        "selected_jobs":
-                            [],
-
-                        "pipeline_name":
-                            None,
-
-                        "frequency":
-                            None,
-
-                        "start_date":
-                            None,
-
-                        "time_utc":
-                            None
+                        "step": "select_jobs",
+                        "selected_jobs": [],
+                        "available_jobs": jobs,
+                        "pipeline_name": None,
+                        "frequency": None,
+                        "start_date": None,
+                        "time_utc": None
                     }
                 }
             )
 
             pipeline_response = {
-
-                "status":
-                    "pipeline_job_selection_required",
-
-                "jobs":
-                    jobs
+                "status": "pipeline_job_selection_required",
+                "jobs": jobs
             }
 
             thread_service.add_action(
-
                 thread_id=req.thread_id,
-
-                role = "assistant",
-
+                role="assistant",
                 action_type="pipeline_wizard",
-
                 status="waiting",
-
-                request={
-                     "prompt":
-                         "Select jobs for pipeline creation"
-                },
-
+                request={"prompt": "Select jobs for pipeline creation"},
                 response=pipeline_response
             )
 
@@ -4162,78 +3563,49 @@ async def chat(req: ChatRequest):
         # =====================================================
 
         error_response = {
-
             "status": "failed",
-
-            "message":
-                "Intent not implemented yet."
+            "message": "Intent not implemented yet."
         }
 
         thread_service.add_action(
-
             thread_id=req.thread_id,
-
             role="assistant",
-
             action_type="chat",
-
             status="failed",
-
-            request={
-                "prompt": req.message
-            },
-
+            request={"prompt": req.message},
             response=error_response
         )
 
         return error_response
-    
+
     except Exception as e:
 
-        print(
-            "❌ CHAT ERROR:",
-            str(e)
-        )
+        print("❌ CHAT ERROR:", str(e))
 
         thread_service.add_message(
-
             thread_id=req.thread_id,
-
             role="assistant",
-
             content=str(e),
-
             message_type="error",
         )
 
         thread_service.add_action(
-
             thread_id=req.thread_id,
-
             role="assistant",
-
             action_type="chat",
-
             status="failed",
-
-            request={
-                "prompt": req.message
-            },
-
+            request={"prompt": req.message},
             response={
-
                 "status": "failed",
-
                 "error": str(e)
             }
         )
 
         raise HTTPException(
-
             status_code=500,
-
             detail=str(e)
         )
+    
 
 # =========================
 # PIPELINES
