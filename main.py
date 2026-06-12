@@ -1653,6 +1653,7 @@ def rename_job(req: RenameJobRequest):
             detail=str(e)
         )
 
+
 @app.post("/rename-dataset")
 def rename_dataset(req: RenameDatasetRequest):
 
@@ -1705,13 +1706,15 @@ def rename_dataset(req: RenameDatasetRequest):
 
         base_name = (
             req.new_name
+            .replace(".csv", "")
             .replace(" ", "_")
             .replace("-", "_")
             .lower()
             .strip()
         )
 
-        if base_name.endswith("_dataset"):
+        # If dataset already exists anywhere in the name
+        if "_dataset" in base_name:
 
             new_dataset_name = base_name
 
@@ -2061,6 +2064,7 @@ def rename_dataset(req: RenameDatasetRequest):
             status_code=500,
             detail=str(e)
         )
+
 
 # =========================
 # GET JOBS
