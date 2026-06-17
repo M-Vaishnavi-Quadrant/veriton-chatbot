@@ -320,7 +320,7 @@ class ThreadService:
             raise Exception("Thread not found")
 
         action = {
-            
+
             "role":role,
 
             "action_id": str(uuid.uuid4()),
@@ -372,6 +372,23 @@ class ThreadService:
         self.save_thread(thread)
 
         return thread["context"]
+    
+    def update_thread_name(
+        self,
+        thread_id,
+        thread_name
+    ):
+
+        thread = self.load_thread(
+            thread_id
+        )
+
+        if not thread:
+            return
+
+        thread["thread_name"] = thread_name
+
+        self.save_thread(thread)
 
     # =====================================================
     # ATTACH DATASET
@@ -407,3 +424,124 @@ class ThreadService:
         self.save_thread(thread)
 
         return dataset
+    
+    # =====================================================
+    # UPDATE JOB REFERENCES
+    # =====================================================
+
+    def update_job_references(
+
+        self,
+
+        thread_id,
+
+        job_id,
+
+        new_job_name=None,
+
+        new_dataset_name=None,
+
+        new_dataset_path=None
+    ):
+
+        thread = self.load_thread(thread_id)
+
+        if not thread:
+            return
+
+        updated = False
+
+        # ==========================================
+        # UPDATE ACTIONS
+        # ==========================================
+
+        for action in thread.get("actions", []):
+
+            response = action.get("response", {})
+
+            if response.get("job_id") != job_id:
+                continue
+
+            # --------------------------
+            # JOB NAME
+            # --------------------------
+
+            if new_job_name:
+
+                if "job_name" in response:
+
+                    response["job_name"] = (
+                        new_job_name
+                    )
+
+            # --------------------------
+            # DATASET NAME
+            # --------------------------
+
+            if new_dataset_name:
+
+                if "dataset_name" in response:
+
+                    response["dataset_name"] = (
+                        new_dataset_name
+                    )
+
+                if (
+                    "final_dataset" in response
+                    and
+                    isinstance(
+                        response["final_dataset"],
+                        dict
+                    )
+                ):
+
+                    response[
+                        "final_dataset"
+                    ][
+                        "dataset_name"
+                    ] = new_dataset_name
+
+            # --------------------------
+            # DATASET PATH
+            # --------------------------
+
+            if new_dataset_path:
+
+                if "blob_path" in response:
+
+                    response["blob_path"] = (
+                        new_dataset_path
+                    )
+
+                if "dataset_path" in response:
+
+                    response["dataset_path"] = (
+                        new_dataset_path
+                    )
+
+                if (
+                    "final_dataset" in response
+                    and
+                    isinstance(
+                        response["final_dataset"],
+                        dict
+                    )
+                ):
+
+                    response[
+                        "final_dataset"
+                    ][
+                        "dataset_path"
+                    ] = new_dataset_path
+
+                    response[
+                        "final_dataset"
+                    ][
+                        "download_path"
+                    ] = new_dataset_path
+
+            updated = True
+
+        if updated:
+
+            self.save_thread(thread)
