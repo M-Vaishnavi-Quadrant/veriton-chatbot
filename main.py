@@ -20,6 +20,10 @@ from openai import AzureOpenAI
 from pydantic import BaseModel
 from fastapi.responses import StreamingResponse
 
+from utils.job_utils import (
+    generate_unique_job_name
+)
+
 from config import (
     AZURE_OPENAI_API_KEY,
     AZURE_OPENAI_API_VERSION,
@@ -476,7 +480,6 @@ def run(req: RunRequest):
         if dataset_df is None:
             raise Exception("Pipeline did not return dataframe")
 
-
         # ==========================================
         # JOB NAME
         # ==========================================
@@ -491,7 +494,6 @@ def run(req: RunRequest):
             .replace(".csv", "")
         )
 
-        # Remove _dataset suffix if present
         if base_name.endswith("_dataset"):
             base_name = base_name[:-8]
 
@@ -501,6 +503,32 @@ def run(req: RunRequest):
             .replace("-", "_")
             .lower()
             .strip()
+        )
+
+        # ==========================================
+        # MAKE JOB NAME UNIQUE
+        # ==========================================
+
+        existing_jobs = (
+            cosmos_service.list_jobs(
+                req.user_id
+            )
+        )
+
+        existing_names = [
+
+            job.get("job_name")
+
+            for job in existing_jobs
+
+            if job.get("job_name")
+        ]
+
+        job_name = generate_unique_job_name(
+
+            job_name,
+
+            existing_names
         )
 
         print(f"📌 Job Name: {job_name}")
@@ -640,6 +668,13 @@ def run(req: RunRequest):
                 "selected_dataset": dataset_info,
                 "latest_dataset_path": dataset_path,
             },
+        )
+
+        thread_service.update_thread_name(
+
+            req.thread_id,
+
+            job_name
         )
 
         # ==========================================
@@ -1530,6 +1565,18 @@ def rename_job(req: RenameJobRequest):
             job
         )
 
+        if req.thread_id:
+
+            thread_service.update_job_references(
+
+                thread_id=req.thread_id,
+
+                job_id=req.job_id,
+
+                new_job_name=new_job_name
+            )
+        
+
         print("✅ Cosmos updated")
 
         # ==================================
@@ -1652,7 +1699,6 @@ def rename_job(req: RenameJobRequest):
             status_code=500,
             detail=str(e)
         )
-
 
 @app.post("/rename-dataset")
 def rename_dataset(req: RenameDatasetRequest):
@@ -1880,6 +1926,19 @@ def rename_dataset(req: RenameDatasetRequest):
             new_onelake_path=old_onelake_path
         )
 
+        if req.thread_id:
+
+            thread_service.update_job_references(
+
+                thread_id=req.thread_id,
+
+                job_id=req.job_id,
+
+                new_dataset_name=new_dataset_name,
+
+                new_dataset_path=new_dataset_path
+            )
+
         print(
             "✅ Created dataset updated"
         )
@@ -2064,7 +2123,6 @@ def rename_dataset(req: RenameDatasetRequest):
             status_code=500,
             detail=str(e)
         )
-
 
 # =========================
 # GET JOBS
@@ -3610,25 +3668,6 @@ async def chat(req: ChatRequest):
             detail=str(e)
         )
     
-
-# =========================
-# PIPELINES
-# =========================
-
-@app.get("/pipelines")
-def get_pipelines(user_id: str):
-    return pipeline_manager.list_pipelines(user_id)
-
-
-@app.post("/pipelines/add-job")
-def add_job_to_pipeline(user_id: str, pipeline_id: str, job_id: str):
-    pipeline = pipeline_manager.get_pipeline(user_id, pipeline_id)
-    if job_id not in pipeline["jobs"]:
-        pipeline["jobs"].append(job_id)
-    pipeline_manager.update_schedule(user_id, pipeline_id, pipeline.get("schedule"))
-    return pipeline
-
-
 # =========================
 # UPLOAD DATASET (with job_id)
 # =========================
