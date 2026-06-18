@@ -1366,6 +1366,7 @@ def save_job(req: SaveJobRequest):
             },
         )
 
+
         # ==========================================
         # ASSISTANT MESSAGE
         # ==========================================
@@ -1592,6 +1593,13 @@ def rename_job(req: RenameJobRequest):
                 {
                     "job_name": new_job_name
                 }
+            )
+
+            thread_service.update_thread_name(
+
+                req.thread_id,
+
+                new_job_name
             )
 
             thread_service.add_message(
@@ -3399,7 +3407,10 @@ async def chat(req: ChatRequest):
                     "selected_dataset": {
                         **dataset,
                         "ner_applied": True,
-                        "entity_columns": response.get("entity_columns_created", []),
+                        "resolutions_found": response.get(
+                            "resolutions_found",
+                            0
+                        )
                     },
                 },
             )
@@ -3407,7 +3418,7 @@ async def chat(req: ChatRequest):
             thread_service.add_message(
                 thread_id=req.thread_id,
                 role="assistant",
-                content="NER completed successfully",
+                content="Entity resolution completed successfully. Dataset values were standardized where applicable.",
                 message_type="completion",
                 metadata=response,
             )
