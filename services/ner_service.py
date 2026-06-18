@@ -135,6 +135,139 @@ Do not include markdown.
         raw = raw.strip()
 
         return json.loads(raw)
+    
+    def resolve_entities_batch(self, values):
+
+        prompt = f"""
+    You are an entity resolution engine.
+
+    Analyze these values.
+
+    Identify values that represent the same real-world entity
+    and provide a standardized value.
+
+    Only resolve values that are clearly abbreviations,
+aliases,
+alternate spellings,
+or duplicate representations of the same entity.
+
+Do NOT rename:
+- business terms
+- financial metrics
+- product names
+- valid values
+
+Examples:
+
+NYC -> New York
+LA -> Los Angeles
+
+Do NOT do:
+
+Revenue -> Total Revenue
+Profit -> Net Profit
+EBITDA -> Earnings
+
+    Return ONLY valid JSON.
+
+    Format:
+
+    {{
+    "original_value": {{
+        "resolved_value": "standardized value",
+        "confidence": 95
+    }}
+    }}
+
+   Only include values that are abbreviations,
+aliases,
+misspellings,
+or duplicate representations
+of the same entity.
+
+Examples:
+
+NYC -> New York
+LA -> Los Angeles
+Hyd -> Hyderabad
+
+Do NOT change:
+
+Bangalore -> Bengaluru
+Mumbai -> Bombay
+Revenue -> Total Revenue
+Profit -> Net Profit
+Aarav -> Aarav
+
+Only return values when the original
+value is clearly an abbreviation,
+alias, or incorrect representation.
+
+    Examples:
+
+    Input:
+    ["NYC", "New York", "LA", "Los Angeles"]
+
+    Output:
+    {{
+    "NYC": {{
+        "resolved_value": "New York",
+        "confidence": 100
+    }},
+    "LA": {{
+        "resolved_value": "Los Angeles",
+        "confidence": 95
+    }}
+    }}
+
+    IMPORTANT:
+
+Only return values that actually need standardization.
+
+Do NOT return values that are already correct.
+
+Examples:
+
+Return:
+NYC -> New York
+LA -> Los Angeles
+Hyd -> Hyderabad
+
+Do NOT return:
+Aarav -> Aarav
+Mumbai -> Mumbai
+Patel -> Patel
+Revenue -> Revenue
+
+    Values:
+    {values}
+    """
+
+        response = self.client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": """
+    Return ONLY valid JSON.
+    Do not include markdown.
+    """
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0
+        )
+
+        raw = response.choices[0].message.content.strip()
+
+        raw = raw.replace("```json", "")
+        raw = raw.replace("```", "")
+        raw = raw.strip()
+
+        return json.loads(raw)
 
     # =====================================================
     # GET VALID NER COLUMNS
@@ -228,9 +361,9 @@ Do not include markdown.
 
         text_cols = self.get_ner_columns(df)
 
-        entity_columns = []
-
         entity_summary = {}
+
+        resolutions = []
 
         rows_processed = len(df)
 
@@ -243,8 +376,6 @@ Do not include markdown.
             try:
 
                 print(f"\n🔍 Running NER for column: {col}")
-
-                entity_col = f"{col}_entity"
 
                 # ==========================================
                 # UNIQUE VALUES ONLY
@@ -269,7 +400,7 @@ Do not include markdown.
                     continue
 
                 # ==========================================
-                # DETECT ENTITIES
+                # ENTITY DETECTION
                 # ==========================================
 
                 entity_map = self.detect_entities_batch(
@@ -277,35 +408,92 @@ Do not include markdown.
                 )
 
                 # ==========================================
-                # MAP BACK TO DATAFRAME
+                # ENTITY COUNTS (NO NEW COLUMNS)
                 # ==========================================
 
-                df[entity_col] = (
+                value_counts = (
                     df[col]
+                    .dropna()
                     .astype(str)
                     .str.strip()
-                    .map(entity_map)
-                    .fillna("UNKNOWN")
-                )
-
-                entity_columns.append(entity_col)
-
-                # ==========================================
-                # SUMMARY COUNTS
-                # ==========================================
-
-                counts = (
-                    df[entity_col]
                     .value_counts()
                     .to_dict()
                 )
 
-                for entity, count in counts.items():
+                for value, count in value_counts.items():
+
+                    entity = entity_map.get(
+                        value,
+                        "UNKNOWN"
+                    )
 
                     entity_summary[entity] = (
                         entity_summary.get(entity, 0)
                         + int(count)
                     )
+
+                # ==========================================
+                # ENTITY RESOLUTION
+                # ==========================================
+
+                resolution_map = self.resolve_entities_batch(
+                    unique_values
+                )
+
+                # ==========================================
+                # STORE RESOLUTION REPORT
+                # ==========================================
+
+                valid_resolution_map = {}
+
+                for original, info in resolution_map.items():
+
+                    resolved_value = info.get(
+                        "resolved_value",
+                        original
+                    )
+
+                    confidence = info.get(
+                        "confidence",
+                        100
+                    )
+
+                    # Skip if nothing changed
+                    if (
+                        str(original).strip().lower()
+                        ==
+                        str(resolved_value).strip().lower()
+                    ):
+                        continue
+
+                    # Skip low confidence
+                    if confidence < 95:
+                        continue
+
+                    valid_resolution_map[original] = resolved_value
+
+                    resolutions.append(
+                        {
+                            "column": col,
+                            "original": original,
+                            "resolved": resolved_value,
+                            "confidence": confidence
+                        }
+                    )
+
+                # ==========================================
+                # OVERWRITE ORIGINAL VALUES
+                # ==========================================
+
+                df[col] = df[col].apply(
+                    lambda x:
+                    valid_resolution_map.get(
+                        str(x).strip(),
+                        x
+                    )
+                    if pd.notna(x)
+                    else x
+                )
 
             except Exception as e:
 
@@ -316,10 +504,41 @@ Do not include markdown.
                 continue
 
         # =================================================
-        # SAVE ENRICHED DATASET
+        # SAVE UPDATED DATASET
         # =================================================
 
         self.save_dataset(df, blob)
+
+        summary = []
+
+        if entity_summary.get("PERSON"):
+            summary.append(
+                f"Identified {entity_summary['PERSON']} customer/person records"
+            )
+
+        if entity_summary.get("EMAIL"):
+            summary.append(
+                f"Identified {entity_summary['EMAIL']} email addresses"
+            )
+
+        if entity_summary.get("LOCATION"):
+            summary.append(
+                f"Identified {entity_summary['LOCATION']} location records"
+            )
+
+        if entity_summary.get("PRODUCT"):
+            summary.append(
+                f"Identified {entity_summary['PRODUCT']} product records"
+            )
+
+        if len(resolutions) > 0:
+            summary.append(
+                f"Standardized {len(resolutions)} values across the dataset"
+            )
+        else:
+            summary.append(
+                "No value standardization was required"
+            )
 
         # =================================================
         # RESPONSE
@@ -330,6 +549,14 @@ Do not include markdown.
             "blob_path": blob_path,
             "rows_processed": rows_processed,
             "columns_processed": len(text_cols),
-            "entity_columns_created": entity_columns,
-            "entities_detected": entity_summary
+            "summary": summary,
+
+            # reporting only
+            "entities_detected": entity_summary,
+
+            # actual resolutions applied
+            "resolutions_found": len(resolutions),
+            "resolutions": resolutions,
+
+            "dataset_updated": True
         }
