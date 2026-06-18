@@ -386,7 +386,7 @@ class ThreadService:
         if not thread:
             return
 
-        thread["thread_name"] = thread_name
+        thread["title"] = thread_name
 
         self.save_thread(thread)
 
