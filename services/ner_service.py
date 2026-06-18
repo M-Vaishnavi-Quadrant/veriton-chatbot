@@ -5,6 +5,7 @@
 from io import BytesIO
 import json
 import pandas as pd
+import time
 
 from azure.storage.blob import BlobServiceClient
 
@@ -134,7 +135,11 @@ Do not include markdown.
         raw = raw.replace("```", "")
         raw = raw.strip()
 
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"NER JSON Error: {e}")
+            return {}
     
     def resolve_entities_batch(self, values):
 
@@ -178,6 +183,22 @@ EBITDA -> Earnings
         "confidence": 95
     }}
     }}
+
+    Do NOT convert official city names
+to alternative official city names.
+
+Examples:
+
+Do NOT change:
+Bangalore -> Bengaluru
+Mumbai -> Bombay
+Kolkata -> Calcutta
+Chennai -> Madras
+
+Only resolve:
+NYC -> New York
+LA -> Los Angeles
+Hyd -> Hyderabad
 
    Only include values that are abbreviations,
 aliases,
@@ -267,7 +288,11 @@ Revenue -> Revenue
         raw = raw.replace("```", "")
         raw = raw.strip()
 
-        return json.loads(raw)
+        try:
+            return json.loads(raw)
+        except Exception as e:
+            print(f"Resolution JSON Error: {e}")
+            return {}
 
     # =====================================================
     # GET VALID NER COLUMNS
@@ -403,9 +428,17 @@ Revenue -> Revenue
                 # ENTITY DETECTION
                 # ==========================================
 
+                start = time.time()
+
                 entity_map = self.detect_entities_batch(
                     unique_values
                 )
+
+                print(
+                    f"NER {col} took {time.time() - start:.2f}s"
+                )
+
+                detected_types = set(entity_map.values())
 
                 # ==========================================
                 # ENTITY COUNTS (NO NEW COLUMNS)
@@ -436,9 +469,22 @@ Revenue -> Revenue
                 # ENTITY RESOLUTION
                 # ==========================================
 
-                resolution_map = self.resolve_entities_batch(
-                    unique_values
-                )
+                resolution_map = {}
+
+                if (
+                    "LOCATION" in detected_types
+                    or "ORGANIZATION" in detected_types
+                ):
+
+                    start = time.time()
+
+                    resolution_map = self.resolve_entities_batch(
+                        unique_values
+                    )
+
+                    print(
+                        f"Resolution {col} took {time.time() - start:.2f}s"
+                    )
 
                 # ==========================================
                 # STORE RESOLUTION REPORT
