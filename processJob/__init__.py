@@ -18,6 +18,8 @@ from datetime import datetime
 import sys
 import os
 import io
+from collections import Counter
+
 
 logging.basicConfig(level=logging.INFO)
 
@@ -34,6 +36,8 @@ USER_CONTAINER_NAME = os.getenv("USER_CONTAINER_NAME", "userdata")
 RELATIONSHIPS_CONTAINER_NAME = os.getenv("RELATIONSHIPS_CONTAINER_NAME", "relationships")
 NORMALIZED_CONTAINER_NAME = os.getenv("NORMALIZED_CONTAINER_NAME", "normalized")
 METADATA_CONTAINER_NAME = os.getenv("METADATA_CONTAINER_NAME", "metadata")
+
+PROCESSING_QUEUE_NAME = os.getenv("PROCESSING_QUEUE_NAME", "processing-jobs")
 
 try:
     from shared.shared import (
@@ -64,7 +68,8 @@ def _normalize_name(name: str) -> str:
 # ====================================================================
 # MAIN ENTRY POINT
 # ====================================================================
-def main(req: func.HttpRequest) -> func.HttpResponse:
+def main(msg: func.QueueMessage) -> None:
+
     """
     HTTP-triggered function that processes a job folder.
 
@@ -88,9 +93,10 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         # GET REQUEST PARAMETERS
         # ============================================================
         try:
-            body = req.get_json()
+            body = json.loads(msg.get_body().decode())
         except ValueError:
-            return _error_response("Invalid JSON in request body", 400)
+            logging.error("Failed to parse queue message body as JSON")
+            return
 
         user_id        = body.get("user_id")
         job_id         = body.get("job_id")
@@ -98,7 +104,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         ai_only        = bool(body.get("ai_only", False))
 
         if not user_id or not job_id:
-            return _error_response("user_id and job_id are required", 400)
+            _write_failure(user_id, job_id, "some message")
+            return
 
         logging.info(f"📦 Container : {container_name}")
         logging.info(f"👤 User      : {user_id}")
@@ -177,7 +184,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             job_data["status"] = "failed"
             job_data["error"]  = "No processable files found"
             job_status_blob.upload_blob(json.dumps(job_data, indent=2), overwrite=True)
-            return _error_response("No processable files found", 400)
+            _write_failure(user_id, job_id, "some message")
+            return
 
         logging.info(f"✅ Found {len(processable_files)} file(s)")
         for f in processable_files:
@@ -264,7 +272,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             job_data["status"] = "failed"
             job_data["error"]  = "Schema extraction failed for all files"
             job_status_blob.upload_blob(json.dumps(job_data, indent=2), overwrite=True)
-            return _error_response("Schema extraction failed", 500)
+            _write_failure(user_id, job_id, "some message")
+            return
 
         logging.info("=" * 80)
         logging.info(f"✅ Schema extraction complete:")
@@ -300,7 +309,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             logging.error(
                 f"❌ Additionally failed to write error status to blob: {status_err}"
             )
-        return _error_response(str(e), 500)
+        _write_failure(user_id, job_id, "some message")
+        return
 
 
 # ====================================================================
@@ -337,7 +347,8 @@ def _handle_ai_only_retry(
         job_data["status"] = "failed"
         job_data["error"]  = "No existing schemas found for AI retry"
         job_status_blob.upload_blob(json.dumps(job_data, indent=2), overwrite=True)
-        return _error_response("No schemas found to retry", 400)
+        _write_failure(user_id, job_id, "some message")
+        return
 
     logging.info(f"✅ Loaded {len(schemas)} existing schema(s) for AI retry")
 
@@ -419,6 +430,10 @@ def _run_er_modeling_and_save(
     logging.info("=" * 80)
 
     virtual_fact_columns = []
+    valid_table_names = {
+        _normalize_name(t.get("table", ""))
+        for t in relationship_info.get("tables", [])
+    }
     virtual_fact_fks     = []
     existing_columns     = []
     all_dim_tables       = []
@@ -455,6 +470,36 @@ def _run_er_modeling_and_save(
                 f"fact_entity_override '{fact_override}' not found in normalized_tables. "
                 f"Available: {[t.get('table') for t in normalized_tables]}. "
                 f"No fact table will be assigned — model will be ER-only."
+            )
+    elif candidates:
+        # fact_entity_override is only ever set by shared.py's AI-success path.
+        # On rule_based_fallback it's always None, even when `candidates` (tables
+        # with real outgoing FKs) is non-empty. Score them ourselves instead of
+        # automatically collapsing to ER-only.
+        inbound_refs = Counter(
+            _normalize_name(r.get("to_table", ""))
+            for r in relationship_info.get("relationships", [])
+        )
+
+        def _fact_score(t):
+            key = _normalize_name(t.get("table", ""))
+            if inbound_refs[key] >= 2:
+                return -1  # heavily-referenced table = dimension, not a fact
+            fk_count = outgoing_fk_count(t)
+            measure_count = sum(
+                1 for a in t.get("attributes", [])
+                if not a.get("is_foreign_key") and not a.get("is_surrogate")
+                and any(nt in a.get("data_type", "").lower()
+                        for nt in {"int", "double", "float", "decimal", "bigint", "long"})
+            )
+            return fk_count * 3 + measure_count
+
+        best = max(candidates, key=_fact_score)
+        if _fact_score(best) > 0:
+            fact_entity = best
+            logging.info(
+                f"   ℹ️  No AI fact_entity_override — selected '{best.get('table')}' "
+                f"as fact entity from fallback candidates (score={_fact_score(best)})"
             )
 
     fact_entity_name = (
@@ -517,38 +562,17 @@ def _run_er_modeling_and_save(
                 if not ref_table:  # skip if still empty
                     continue
 
+                if _normalize_name(ref_table) not in valid_table_names:
+                    logging.warning(
+                        f"⚠️ Skipping FK '{col_name}' → '{ref_table}': "
+                        f"target table not present in final tables list"
+                    )
+                    continue
+
                 virtual_fact_fks.append({
                     "column": col_name,
                     "references_table": ref_table.lower() if ref_table else "",
                     "references_column": fk.get("references_column")
-                })
-        # Inject DateKey FK if date_dimension exists
-        date_dim_exists = any(
-            _normalize_name(t.get("table", "")) == "date_dimension"
-            for t in relationship_info.get("tables", [])
-        )
-        if date_dim_exists:
-            if "DateKey" not in existing_columns:
-                existing_columns.append("DateKey")
-
-                virtual_fact_columns.append({
-                    "column_name": "DateKey",
-                    "data_type": "int",
-                    "nullable": False,
-                    "null_count": 0,
-                    "null_percentage": 0.0,
-                    "distinct_count": 0,
-                    "cardinality_percentage": 0.0,
-                    "is_potential_key": False,
-                    "is_foreign_key": True,
-                    "is_primary_key": False,
-                    "sample_values": []
-                })
-
-                virtual_fact_fks.append({
-                    "column": "DateKey",
-                    "references_table": "date_dimension",
-                    "references_column": "DateKey"
                 })
         # 3. Add numeric measure columns from the fact entity
         # These are the actual measurable values — quantity, amount, price, etc.
@@ -564,8 +588,7 @@ def _run_er_modeling_and_save(
                 continue
             if not is_numeric:
                 continue
-            if is_high_null:
-                continue
+            
 
             existing_columns.append(attr_name)
             virtual_fact_columns.append({
@@ -604,14 +627,11 @@ def _run_er_modeling_and_save(
                 continue
             if is_numeric:
                 continue
-            if is_high_null:
-                continue
             if attr.get("is_foreign_key", False):
                 continue
             if attr.get("is_surrogate", False):
                 continue
-            if "date" in attr_name.lower() and "DateKey" in existing_columns:
-                continue
+            
 
             existing_columns.append(attr_name)
             virtual_fact_columns.append({
@@ -662,8 +682,13 @@ def _run_er_modeling_and_save(
 
     enriched_tables = []
     table_lookup = {
-        t.get("table", "").lower(): t
+        _normalize_name(t.get("table", "")): t
         for t in relationship_info.get("tables", [])
+    }
+    derived_lookup = {
+        _normalize_name(t.get("derived_from", "")): t
+        for t in relationship_info.get("tables", [])
+        if t.get("derived_from")
     }
 
     # Dimension tables
@@ -674,7 +699,8 @@ def _run_er_modeling_and_save(
 
         
 
-        table_info = table_lookup.get(table_name.lower())
+        table_info = table_lookup.get(_normalize_name(table_name)) or derived_lookup.get(_normalize_name(table_name))
+        logging.info(f"DEBUG FK lookup: {table_name} | direct_hit={_normalize_name(table_name) in table_lookup} | derived_hit={_normalize_name(table_name) in derived_lookup}")
 
         if not table_info or not table_info.get("primary_keys"):
             raw = relationship_info.get("raw_entity_analysis", {}).get(table_name, {})
@@ -719,6 +745,12 @@ def _run_er_modeling_and_save(
                 if t.get("is_normalized")
             )
         )
+        fk_column_names = {
+            _normalize_name(fk.get("column", ""))
+            for fk in (table_info.get("foreign_keys", []) if table_info else [])
+        }
+        pk_column_names = {_normalize_name(pk) for pk in primary_keys}
+        surrogate_column_names = {_normalize_name(sk) for sk in surrogate_keys}
         
         enriched_tables.append({
             "table_name": table_name,
@@ -731,24 +763,27 @@ def _run_er_modeling_and_save(
             "null_percentage": avg_null_pct,
             "primary_keys":   primary_keys,
             "surrogate_keys": surrogate_keys,
-            "foreign_keys":   [],
+            "foreign_keys":   table_info.get("foreign_keys", []) if table_info else [],
+            
+            
             "columns": [
                 {
                     "name":           col.get("column_name", ""),
                     "data_type":      col.get("data_type", ""),
                     "null_percentage": round(col.get("null_percentage", 0), 1),
                     "distinct_count": col.get("distinct_count", 0),
-                    "is_primary_key": col.get("column_name") in primary_keys,
-                    "is_surrogate":   col.get("column_name") in surrogate_keys,
-                    "is_foreign_key": False,
+                    "is_primary_key": _normalize_name(col.get("column_name", "")) in pk_column_names,
+                    "is_surrogate": _normalize_name(col.get("column_name", "")) in surrogate_column_names,
+                    "is_foreign_key": _normalize_name(col.get("column_name", "")) in fk_column_names,
+
                     "display_label":  (
                         f"{col.get('column_name', '')} ✨"
-                        if col.get("column_name") in surrogate_keys
+                        if _normalize_name(col.get("column_name", "")) in surrogate_column_names
                         else col.get("column_name", "")
                     ),
                     "tooltip": (
                         "AI-generated surrogate key — not present in source file."
-                        if col.get("column_name") in surrogate_keys
+                        if _normalize_name(col.get("column_name", "")) in surrogate_column_names
                         else f"Source column from {table_name}"
                     )
                 }
@@ -1026,18 +1061,19 @@ def _run_er_modeling_and_save(
         job_data["error"]  = f"ER model validation failed: {critical_errors}"
         job_status_blob.upload_blob(json.dumps(job_data, indent=2), overwrite=True)
 
-        return func.HttpResponse(
+        status_blob = container_client.get_blob_client(f"{user_id}/{job_id}/job_status.json")
+        status_blob.upload_blob(
             json.dumps({
-                "status":            "failed",
-                "message":           "ER model failed critical validation. Not saved.",
-                "critical_errors":   critical_errors,
-                "warnings":          warnings,
-                "model_source":      model_source,
+                "status": "failed",
+                "message": "ER model failed critical validation. Not saved.",
+                "critical_errors": critical_errors,
+                "warnings": warnings,
+                "model_source": model_source,
                 "ai_retry_available": ai_retry_available
             }, cls=NumpyEncoder),
-            mimetype="application/json",
-            status_code=422
+            overwrite=True
         )
+        return
 
     logging.info(
         f"✅ Validation passed "
@@ -1130,24 +1166,36 @@ def _run_er_modeling_and_save(
     logging.info(f"   AI retry btn  : {ai_retry_available}")
     logging.info("=" * 80)
 
-    return func.HttpResponse(
-        json.dumps({
-            "status":  "completed",
-            "message": "Processing completed successfully",
-            "stage":   "completed",
-            "data":    complete_analysis
-        }, cls=NumpyEncoder),
-        mimetype="application/json",
-        status_code=200
+    status_blob = container_client.get_blob_client(f"{user_id}/{job_id}/job_status.json")
+    status_blob.upload_blob(
+        json.dumps({"status": "completed", "message": "Processing completed successfully"}, cls=NumpyEncoder),
+        overwrite=True
     )
+    # confirm complete_analysis / relationship data is written to its own blob elsewhere —
+    # check_job_exists() on the FastAPI side reads it from RELATIONSHIPS_CONTAINER_NAME, not job_status.json
+    return
 
 
 # ====================================================================
 # HELPERS
 # ====================================================================
-def _error_response(message: str, status_code: int) -> func.HttpResponse:
-    return func.HttpResponse(
-        json.dumps({"status": "error", "message": message}),
-        status_code=status_code,
-        mimetype="application/json"
-    )
+def _write_failure(user_id: str, job_id: str, message: str) -> None:
+    if not user_id or not job_id:
+        logging.error(f"Cannot write failure status — missing user_id/job_id: {message}")
+        return
+    try:
+        conn_str = (
+            f"DefaultEndpointsProtocol=https;"
+            f"AccountName={STORAGE_ACCOUNT_NAME};"
+            f"AccountKey={STORAGE_ACCOUNT_KEY};"
+            f"EndpointSuffix=core.windows.net"
+        )
+        blob_service     = BlobServiceClient.from_connection_string(conn_str)
+        metadata_client  = blob_service.get_container_client(METADATA_CONTAINER_NAME)
+        status_blob      = metadata_client.get_blob_client(f"{user_id}/{job_id}/job_status.json")
+        status_blob.upload_blob(
+            json.dumps({"status": "failed", "message": message}),
+            overwrite=True
+        )
+    except Exception as e:
+        logging.error(f"Failed to write failure status to blob: {e}")
