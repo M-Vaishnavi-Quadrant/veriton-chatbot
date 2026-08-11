@@ -1,222 +1,227 @@
-import io
-import re
-import pandas as pd
+import boto3
+import os
 from azure.storage.blob import BlobServiceClient
 from config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER
 
 
-class DataModelService:
+class IngestionService:
 
     def __init__(self):
-        self.blob = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
+        # Azure Blob client
+        self.blob_service = BlobServiceClient.from_connection_string(BLOB_CONN_STR)
 
-    def log(self, msg):
-        print(f"[MODEL] {msg}")
+        # S3 client (uses env credentials)
+        self.s3 = boto3.client("s3")
 
-    def normalize(self, col):
+    # =========================================================
+    # NORMALIZE FILE NAME
+    # =========================================================
+    def normalize_filename(self, filename: str) -> str:
+        return os.path.basename(filename).lower()
+
+    # =========================================================
+    # UPLOAD TO AZURE BLOB (INGESTION CONTAINER)
+    # =========================================================
+    def upload_to_blob(self, data, filename, user_id, job_id):
+
+        clean_name = self.normalize_filename(filename)
+        blob_path = f"{user_id}/{job_id}/{clean_name}"
+
+        print(f"📤 Uploading to Blob → {blob_path}")
+
+        blob_client = self.blob_service.get_blob_client(
+            container=DATA_INGESTION_CONTAINER,
+            blob=blob_path
+        )
+
+        blob_client.upload_blob(data, overwrite=True)
+
+        return blob_path
+
+    # =========================================================
+    # RESOLVE ACTUAL S3 KEY (CASE-INSENSITIVE SAFETY NET)
+    # =========================================================
+    def resolve_actual_key(self, bucket, file_name):
         """
-        Normalize a column name to snake_case so FK/PK naming comparisons
-        work regardless of source casing convention.
+        S3 keys are case-sensitive, but upstream callers (e.g. prompt
+        parsing) may pass a different case than what's actually stored.
+        This looks up the bucket contents and matches case-insensitively
+        so a mismatch like 'calendar.csv' vs 'Calendar.csv' doesn't fail.
 
-        Handles:
-          - camelCase / PascalCase -> snake_case  (DateID -> date_id)
-          - existing snake_case / spaces -> unchanged apart from lowering
-          - already-underscored mixed case (supplier_ZipCode -> supplier_zip_code)
-
-        Previously this only lowercased + replaced spaces, so "DateID"
-        became "dateid" (no underscore before "id"), which silently broke
-        every col.endswith("_id") check in detect_relationships() and
-        caused relationship/fact-table detection to fail with zero matches.
+        Falls back to the original file_name if no case-insensitive match
+        is found, so the resulting error still clearly reports NoSuchKey.
         """
-        col = str(col).strip()
+        try:
+            resp = self.s3.list_objects_v2(Bucket=bucket)
+        except Exception as list_err:
+            # Surface *why* listing failed instead of hiding it — this is
+            # commonly a region mismatch or missing s3:ListBucket permission.
+            print(f"⚠️ resolve_actual_key: list_objects_v2 failed for bucket='{bucket}': {list_err}")
+            return file_name
 
-        # Insert underscore between a lowercase/digit and a following uppercase
-        # e.g. "DateID" -> "Date_ID", "PlantID" -> "Plant_ID"
-        col = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', col)
+        keys = [obj["Key"] for obj in resp.get("Contents", [])]
+        print(f"🔎 resolve_actual_key: bucket='{bucket}' contains {len(keys)} object(s): {keys}")
 
-        col = col.lower().replace(" ", "_")
+        for key in keys:
+            if key.lower() == file_name.lower():
+                return key
 
-        # Collapse any accidental double underscores from the substitution
-        col = re.sub(r'_+', '_', col)
+        print(f"⚠️ resolve_actual_key: no case-insensitive match for '{file_name}' in bucket='{bucket}'")
+        return file_name
 
-        return col
+    # =========================================================
+    # S3 INGESTION
+    # =========================================================
+    def ingest_from_s3(self, bucket, file_name, user_id, job_id):
 
-    # =========================
-    # LOAD TABLES
-    # =========================
-    def load_tables(self, user_id, job_id):
+        try:
+            print(f"📥 Fetching from S3 → {bucket}/{file_name}")
 
-        container = self.blob.get_container_client(DATA_INGESTION_CONTAINER)
-        prefix = f"{user_id}/{job_id}/"
+            if not bucket:
+                raise Exception("❌ bucket is required for S3 source")
 
-        tables = {}
+            if not file_name:
+                raise Exception("❌ file_name is required for S3 source")
 
-        for blob in container.list_blobs(name_starts_with=prefix):
+            # Resolve the real, case-correct key before attempting the fetch
+            actual_key = self.resolve_actual_key(bucket, file_name)
 
-            if not blob.name.endswith(".csv"):
-                continue
+            if actual_key != file_name:
+                print(f"🔧 Case mismatch corrected: '{file_name}' → '{actual_key}'")
 
-            name = blob.name.split("/")[-1].replace(".csv", "")
+            # Normalize filename (used for the destination blob name only —
+            # the S3 lookup itself uses actual_key, the real, case-correct key)
+            clean_name = self.normalize_filename(actual_key)
 
-            data = container.get_blob_client(blob.name).download_blob().readall()
+            # Fetch from S3
+            obj = self.s3.get_object(
+                Bucket=bucket,
+                Key=actual_key
+            )
 
-            tables[name] = pd.read_csv(io.BytesIO(data))
+            data = obj["Body"].read()
 
-        return tables
+            # Upload to ingestion container
+            return self.upload_to_blob(data, clean_name, user_id, job_id)
 
-    # =========================
-    # RELATIONSHIP DETECTION (DYNAMIC)
-    # =========================
-    def detect_relationships(self, tables):
+        except Exception as e:
+            # Include bucket + key so failures are traceable when ingesting
+            # multiple files in a single request.
+            raise Exception(
+                f"S3 ingestion failed for bucket='{bucket}' key='{file_name}': {str(e)}"
+            )
 
-        relationships = []
+    # =========================================================
+    # AZURE INGESTION (DYNAMIC CONTAINER)
+    # =========================================================
+    def ingest_from_azure(self, container_name, file_name, user_id, job_id):
 
-        for t1, df1 in tables.items():
-            for t2, df2 in tables.items():
+        try:
+            print(f"📥 Fetching from Azure Blob → {container_name}/{file_name}")
 
-                if t1 == t2:
-                    continue
+            if not container_name:
+                raise Exception("❌ container_name is required for Azure source")
 
-                for c1 in df1.columns:
+            if not file_name:
+                raise Exception("❌ file_name is required for Azure source")
 
-                    col1 = self.normalize(c1)
+            # Normalize filename
+            clean_name = self.normalize_filename(file_name)
 
-                    # =========================
-                    # RULE 1: FK NAMING MATCH
-                    # =========================
-                    if not col1.endswith("_id"):
-                        continue
+            blob_client = self.blob_service.get_blob_client(
+                container=container_name,   # ✅ dynamic container
+                blob=file_name              # supports folders
+            )
 
-                    # =========================
-                    # RULE 2: SAME COLUMN EXISTS
-                    # =========================
-                    for c2 in df2.columns:
+            if not blob_client.exists():
+                raise Exception(f"❌ File not found: {container_name}/{file_name}")
 
-                        col2 = self.normalize(c2)
+            data = blob_client.download_blob().readall()
 
-                        if col1 != col2:
-                            continue
+            # Upload into ingestion container
+            return self.upload_to_blob(data, clean_name, user_id, job_id)
 
-                        try:
-                            s1 = set(df1[c1].dropna())
-                            s2 = set(df2[c2].dropna())
+        except Exception as e:
+            raise Exception(
+                f"Azure ingestion failed for container='{container_name}' key='{file_name}': {str(e)}"
+            )
 
-                            if not s1 or not s2:
-                                continue
+    # =========================================================
+    # MAIN INGESTION ENTRY
+    # =========================================================
+    def ingest_sources(self, sources, user_id, job_id):
 
-                            # =========================
-                            # RULE 3: FK → PK BEHAVIOR
-                            # =========================
-                            uniq1 = len(s1) / len(df1)   # FK side (low uniqueness)
-                            uniq2 = len(s2) / len(df2)   # PK side (high uniqueness)
+        uploaded_paths = []
 
-                            overlap = len(s1 & s2) / len(s1)
+        for src in sources:
 
-                            if (
-                                overlap > 0.2 and      # relaxed
-                                uniq2 > uniq1          # PK side more unique
-                            ):
-                                relationships.append({
-                                    "from_table": t1,
-                                    "to_table": t2,
-                                    "from_column": c1,
-                                    "to_column": c2
-                                })
+            src_type = src.get("type")
 
-                        except:
-                            continue
+            # ---------------- S3 ----------------
+            if src_type == "s3":
 
-        return relationships
+                bucket = src.get("bucket")
+                file_name = src.get("file_name")
 
-    # =========================
-    # CLEAN RELATIONSHIPS
-    # =========================
-    def clean_relationships(self, relationships, fact_table):
+                path = self.ingest_from_s3(
+                    bucket=bucket,
+                    file_name=file_name,
+                    user_id=user_id,
+                    job_id=job_id
+                )
 
-        cleaned = []
-        seen = set()
+            # ---------------- AZURE ----------------
+            elif src_type == "azure":
 
-        for rel in relationships:
+                container_name = src.get("container")
+                file_name = src.get("file_name")
 
-            f = rel["from_table"]
-            t = rel["to_table"]
+                path = self.ingest_from_azure(
+                    container_name=container_name,
+                    file_name=file_name,
+                    user_id=user_id,
+                    job_id=job_id
+                )
 
-            if f == t:
-                continue
+            # ---------------- UPLOAD (handled externally) ----------------
+            elif src_type == "upload":
 
-            # Dedup on table pair + column pair, not just table pair.
-            # Two tables can legitimately share more than one valid FK
-            # link (e.g. productionorders/employees share both EmployeeID
-            # and PlantID) — deduping on table pair alone silently drops
-            # all but one, arbitrarily, based on column iteration order.
-            key = tuple(sorted([
-                f"{f}.{rel['from_column']}",
-                f"{t}.{rel['to_column']}"
-            ]))
+                data = src.get("data")
+                file_name = src.get("file_name")
 
-            if key in seen:
-                continue
+                if not data or not file_name:
+                    raise Exception("❌ upload source requires data and file_name")
 
-            seen.add(key)
-            cleaned.append(rel)
+                path = self.upload_to_blob(
+                    data=data,
+                    filename=file_name,
+                    user_id=user_id,
+                    job_id=job_id
+                )
 
-        final = []
+            else:
+                raise Exception(f"❌ Unsupported source type: {src_type}")
 
-        for rel in cleaned:
-            if rel["from_table"] == fact_table:
-                final.append(rel)
+            uploaded_paths.append(path)
 
-        level1 = {r["to_table"] for r in final}
+        print(f"✅ Uploaded files: {uploaded_paths}")
 
-        for rel in cleaned:
-            if rel["from_table"] in level1:
-                final.append(rel)
+        return uploaded_paths
 
-        return final
+    # =========================================================
+    # DEBUG HELPER — list what actually exists in an S3 bucket
+    # =========================================================
+    def debug_list_s3_keys(self, bucket, prefix=""):
+        """
+        Quick diagnostic: prints every key in `bucket` (optionally filtered
+        by `prefix`) so you can compare exact casing/paths against what
+        your ingestion request is asking for.
+        """
+        resp = self.s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        keys = [obj["Key"] for obj in resp.get("Contents", [])]
 
-    # =========================
-    # FACT DETECTION
-    # =========================
-    def detect_fact(self, relationships, tables):
+        print(f"🔎 Found {len(keys)} object(s) in '{bucket}' (prefix='{prefix}'):")
+        for k in keys:
+            print(f"   - {repr(k)}")
 
-        score = {}
-
-        for rel in relationships:
-            score[rel["from_table"]] = score.get(rel["from_table"], 0) + 1
-
-        if score:
-            return max(score, key=score.get)
-
-        return list(tables.keys())[0]
-
-    # =========================
-    # EXECUTE
-    # =========================
-    def execute(self, user_id, job_id):
-
-        tables = self.load_tables(user_id, job_id)
-
-        relationships = self.detect_relationships(tables)
-
-        fact = self.detect_fact(relationships, tables)
-
-        relationships = self.clean_relationships(relationships, fact)
-
-        schemas = {t: list(df.columns) for t, df in tables.items()}
-
-        self.log(f"Fact: {fact}")
-        self.log(f"Relationships: {len(relationships)}")
-
-        return {
-            "model_output": {
-                "data": {
-                    "model": {
-                        "fact_table": fact,
-                        "dimension_tables": [t for t in tables if t != fact]
-                    },
-                    "relationships": relationships,
-                    "schemas": schemas,
-                    "tables": [{"table_name": t} for t in tables]
-                }
-            }
-        }
+        return keys
