@@ -1,7 +1,7 @@
 import os
 from dotenv import load_dotenv
 
-load_dotenv()  
+load_dotenv()   # 👈 THIS IS THE MISSING PIECE
 
 # Storage
 STORAGE_ACCOUNT_NAME = os.getenv("STORAGE_ACCOUNT_NAME")
@@ -36,6 +36,11 @@ METADATA_CONTAINER = "metadata"
 RELATIONSHIP_CONTAINER = "relationships"
 NORMALIZED_CONTAINER = "normalized"
 V_DATASET_CONTAINER = "datasets"
+
+HANA_PASSWORD=os.getenv("HANA_PASSWORD")
+HANA_USER=os.getenv("HANA_USER")
+HANA_PORT=os.getenv("HANA_PORT")
+HANA_HOST=os.getenv("HANA_HOST")
 
 TENANT_ID = os.getenv("TENANT_ID")
 CLIENT_ID = os.getenv("CLIENT_ID")
