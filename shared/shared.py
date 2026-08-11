@@ -40,9 +40,9 @@ METADATA_CONTAINER_NAME      = os.getenv("METADATA_CONTAINER_NAME", "metadata")
 
 AI_ENDPOINT = os.environ.get("AZURE_OPENAI_ENDPOINT")
 AI_API_KEY  = os.environ.get("AZURE_OPENAI_API_KEY")
-AI_MODEL    = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4.1-mini")
+AI_MODEL    = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
 
-WORKSPACE_ID = os.environ.get("WORKSPACE_ID")
+WORKSPACE_ID = os.environ.get("FABRIC_WORKSPACE_ID")
 WAREHOUSE_ID = os.environ.get("WAREHOUSE_ID")
 
 SUPPORTED_FORMATS = [".csv", ".parquet", ".json"]
@@ -68,11 +68,56 @@ NULL_THRESHOLD_FOR_KEY = 5.0
 # Relationships below this confidence score are rejected
 CONFIDENCE_THRESHOLD = 0.7
 
+# Decomposition consistency: an "ID-pattern" column with a distinct/row ratio
+# below this threshold repeats across rows and is therefore a dimension key,
+# not this table's own identity — even if the AI never flagged the table as
+# denormalized.
+ID_CARDINALITY_THRESHOLD = 0.5
+
+# Don't run cardinality-based decomposition checks on very small tables —
+# not enough rows to trust a distinct/row ratio.
+MIN_ROWS_FOR_DECOMPOSITION_CHECK = 20
+
+# A table needs at least this many low-cardinality ID-pattern columns before
+# we treat it as denormalized on our own initiative.
+MIN_LOW_CARD_ID_COLS_FOR_DECOMPOSITION = 2
+
 def _normalize_name(name: str) -> str:
     """Normalize names for comparison only. Never use output for display."""
     if not name:
         return ""
     return name.lower().strip().replace(" ", "_").replace("-", "_")
+
+def _derived_from_list(entity: dict) -> list:
+    """Split a possibly comma-joined derived_from into normalized parts.
+    Handles both a single source ('Orders') and a merged fact_table
+    ('EmployeeAttendance, HoroscopePredictions, ...')."""
+    raw = entity.get("derived_from", "") or ""
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    return [_normalize_name(p) for p in parts]
+
+
+def _resolve_source_schemas(entity: dict, schema_map: dict) -> list:
+    """Return every source schema this entity was derived from —
+    one for a normal entity, several for a Rule-9b merged fact_table."""
+    return [
+        schema_map[d] for d in _derived_from_list(entity)
+        if d in schema_map
+    ]
+
+
+def _is_id_pattern_column(col_name: str, pk_norm_set: set = None) -> bool:
+    """
+    Heuristic: does this column look like a dimension identifier
+    (e.g. MachineID, LineID, OperatorID, customer_id)?
+    Excludes columns that are already this table's own declared PK.
+    """
+    if not col_name:
+        return False
+    norm = _normalize_name(col_name)
+    if pk_norm_set and norm in pk_norm_set:
+        return False
+    return bool(re.search(r"(^|_)id$", norm)) or norm.endswith("id")
 
 
 # ====================================================================
@@ -162,17 +207,21 @@ def validate_er_model(er_model: dict) -> list:
         
         if not t.get("primary_keys"):
             if not t.get("surrogate_keys"):
-                # Silently skip expected cases
+                standalone_names = {
+                    s if isinstance(s, str) else s.get("table", "")
+                    for s in er_model.get("standalone_entities", [])
+                }
                 if name == "fact_table" or t.get("table_type") == "FACT":
                     pass
+                elif name in standalone_names:
+                    pass  # standalone entity — kept as-is, no PK requirement forced
                 elif t.get("is_normalized") is False and any(
                     e.get("derived_from") == name
                     for e in er_model.get("tables", [])
                 ):
-                    pass  # Source table that was decomposed - no PK expected
+                    pass
                 else:
                     errors.append(f"WARNING: Entity '{name}' has no primary key or surrogate key.")
-
         # Surrogate keys must NOT appear in source_columns
         surrogate_set = set(t.get("surrogate_keys", []))
         source_set    = set(t.get("source_columns", []))
@@ -202,6 +251,9 @@ def validate_er_model(er_model: dict) -> list:
 
     return errors
 
+def _estimate_max_tokens(schemas_for_prompt, base=6000, per_column=150, ceiling=30000):
+    col_count = sum(len(s.get("columns", [])) for s in schemas_for_prompt)
+    return min(ceiling, base + per_column * col_count)
 
 # ====================================================================
 # RELATIONSHIP DETECTION  (AI-powered with fallback)
@@ -262,14 +314,40 @@ def detect_relationships(schemas, source_dfs=None):
         "7. For every relationship, assign a confidence score 0.0–1.0. "
         "OMIT any relationship where confidence < 0.7.\n"
         "8. Output ONLY valid JSON. No markdown. No explanation outside the JSON.\n\n"
+        "8b. Every string value, including 'cardinality_diagram', must be a single "
+        "continuous JSON string. NEVER use '+' to concatenate strings, and NEVER use "
+        "JavaScript/Python string-concatenation or template-literal syntax. Use '\\n' "
+        "inside one quoted string for line breaks instead of splitting it across "
+        "multiple '+'-joined strings. Output must be strict RFC 8259 JSON, parseable "
+        "by json.loads() with zero preprocessing or repair.\n\n"
         "9. Name the fact entity 'fact_table'.\n"
+        "9b. If multiple input tables each have their own numeric measures "
+        "and outgoing foreign keys, and do NOT reference each other, they "
+        "represent different event types at a comparable grain — do NOT "
+        "pick just one as fact_table. Instead define a SINGLE fact_table "
+        "that is the union of all of them, with:\n"
+        "    - an 'event_type' attribute (one distinct value per source "
+        "      table, e.g. 'PRODUCTION', 'QUALITY', 'ATTENDANCE', 'SALES')\n"
+        "    - a 'source_record_id' attribute holding that row's original "
+        "      primary key from its source table, for traceability\n"
+        "    - shared attribute names ONLY where the meaning is genuinely "
+        "      the same across sources (e.g. a date column used by all); "
+        "      source-specific measures/attributes may be null on rows "
+        "      from a different event_type\n"
+        "    Note in observations which source table each event_type's "
+        "    row-shape came from.\n"
+        
         "10. If an entity is nominated as the fact candidate, do NOT also create a separate "
         "    DIM entity derived from the same source with overlapping FK columns. "
         "    The fact entity IS that grain — it must not have a dimension twin.\n"
-        "11. If the fact entity contains date/datetime columns, extract a 'date_dimension'. "
-        "The date_dimension MUST use a surrogate key named 'DateKey' (integer, format YYYYMMDD). "
-        "The attributes must be: DateKey (PK surrogate), Date, Year, Month, Day, Quarter, DayOfWeek. "
-        "The fact entity must contain a DateKey foreign key referencing date_dimension.DateKey.\n"
+        "10b. If one fact-like source table references another fact-like "
+        "source table's own primary key (not a shared dimension), and both "
+        "were merged under Rule 9b, model that as a self-referencing "
+        "'parent_record_id' attribute on fact_table — do NOT invent a "
+        "separate dimension for it.\n"
+        "11. Keep date/datetime columns as regular attributes on the entity "
+        "they came from (e.g. fact_table). Do NOT extract a separate date_dimension "
+        "unless the source data itself is already a standalone calendar/date table."
         "11b. If the fact entity contains string descriptive columns that are not FKs "
         "     (e.g. product name, status, category), keep them on the fact table as "
         "     degenerate dimensions. Do NOT drop them silently.\n"
@@ -278,10 +356,10 @@ def detect_relationships(schemas, source_dfs=None):
         "     numbers, zip codes, years used as labels, or any column whose name "
         "     contains 'phone', 'zip', 'code', 'year' unless it is explicitly a "
         "     measure like revenue or count.\n"
-        "12. If NO relationships exist between the provided tables, set "
-        "    'relationships' to [], 'standalone_entities' to the list of "
-        "    actual input table names only, and 'cardinality_diagram' to ''. "
-        "    Do NOT invent a fact_table entry.\n"
+        "12. If NO relationships exist between ALL tables, mark them as standalone_entities. "
+        "EXCEPTION: a table that was merged into fact_table under Rule 9b is NOT standalone — "
+        "do not list it in standalone_entities even if it has no direct FK relationships to "
+        "other remaining entities.\n"
         "12b. If no relationships exist, do NOT mention choosing a fact entity in observations. "
         "     Only state that no relationships were found and list the standalone entities.\n"
         "13. Every entity referenced in 'relationships' MUST also be defined in "
@@ -294,10 +372,16 @@ def detect_relationships(schemas, source_dfs=None):
         "entities are embedded in it.\n"
         "Step 2 — Decompose denormalized tables into normalized entities with proper PKs/FKs.\n"
         "Step 2b — Choose ONE modeling approach and stick to it:\n"
-        "  • The highest-grain entity (most FKs + numeric measures) becomes the fact entity.\n"
+        "  • If exactly one input table is the natural highest grain "
+        "    (has FKs + measures, and other tables reference it), that one "
+        "    becomes fact_table.\n"
+        "  • If MULTIPLE input tables are each fact-like on their own and "
+        "    don't reference each other, apply Rule 9b: union them into "
+        "    one fact_table with an event_type discriminator instead of "
+        "    picking a single winner.\n"
         "  • Name it fact_table.\n"
         "  • Do NOT also create a DIM entity for that same grain from the same source.\n"
-        "  • All other embedded concepts become dimension entities.\n"
+        "  • Do NOT create both a bridge/junction table AND a fact entity for the same grain.\n"
 "  • Do NOT create both a bridge/junction table AND a fact entity for the same grain.\n"
         "Step 3 — Determine relationships (1:1, 1:M, M:N) between entities.\n"
         "Step 4 — Assign confidence scores to each relationship.\n"
@@ -364,7 +448,8 @@ def detect_relationships(schemas, source_dfs=None):
         "SCHEMAS:\n"
         f"{json.dumps(formatted_schemas, indent=2, cls=NumpyEncoder)}"
     )
-
+    content = None
+    finish_reason = None
     try:
         logging.info("📤 Sending schemas to Azure OpenAI for ER modeling...")
 
@@ -378,9 +463,11 @@ def detect_relationships(schemas, source_dfs=None):
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0,
-                    max_tokens=5000
+                    max_tokens=_estimate_max_tokens(formatted_schemas)
                 )
-                content   = response.choices[0].message.content.strip()
+                content       = response.choices[0].message.content.strip()
+                finish_reason = response.choices[0].finish_reason
+                logging.info(f"📥 AI response received | finish_reason={finish_reason} | length={len(content)} chars")
                 ai_result = _extract_json_from_text(content)
 
                 logging.info("✅ AI ER model received — validating structure...")
@@ -404,6 +491,8 @@ def detect_relationships(schemas, source_dfs=None):
 
     except Exception as e:
         logging.exception("❌ AI ER modeling failed. Using rule-based fallback.")
+        if content:
+            logging.error(f"🔎 RAW AI RESPONSE (finish_reason={finish_reason}, length={len(content)} chars):\n{content}")
         return _fallback_relationship_detection(schemas)
 
 
@@ -526,31 +615,7 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
                     "references_column": ref_col.strip() if isinstance(ref_col, str) else ref_col
                 })
         # ---------------------------------------------------------
-        # Fix Date Dimension Keys (force DateKey surrogate)
-        # ---------------------------------------------------------
-        if _normalize_name(entity_name) == "date_dimension":
-            attr_names = {a.get("name", "").lower() for a in attributes}
-
-            # If AI forgot DateKey, create it
-            if "datekey" not in attr_names:
-                attributes.insert(0, {
-                    "name": "DateKey",
-                    "data_type": "int",
-                    "is_foreign_key": False,
-                    "is_surrogate": True,
-                    "references": None,
-                    "source": "ai_generated",
-                    "display_label": "DateKey ✨",
-                    "tooltip": "Generated surrogate key for date dimension"
-                })
-
-                surrogate_keys.insert(0, "DateKey")
-                primary_key = ["DateKey"]
-
-                observations.append(
-                    "INFO: Added DateKey surrogate to date_dimension"
-                )
-
+       
         # Only first surrogate should be PK — rest are regular attributes
         if len(surrogate_keys) > 1:
             observations.append(
@@ -595,10 +660,6 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
                 for col in source_schema.get("columns", []):
                     cname = col.get("column_name", "")
                     if _normalize_name(cname) not in already_tracked:
-                        if "date" in cname.lower() and any(
-                            f["column"] == "DateKey" for f in foreign_keys
-                        ):
-                            continue
                         attributes.append({
                             "name":          cname,
                             "data_type":     col.get("data_type", "string"),
@@ -651,17 +712,7 @@ def _transform_ai_result_to_standard_format(ai_result, schemas):
             "confidence":        confidence
         })
 
-    # ---------------------------------------------------------
-    # Fix DateKey relationship mismatch
-    # ---------------------------------------------------------
-    for rel in relationships:
-        if _normalize_name(rel.get("to_table", "")) == "date_dimension":
-            if rel.get("to_column", "").lower() == "date":
-                rel["to_column"] = "DateKey"
-                observations.append(
-                    "INFO: Fixed relationship to date_dimension using DateKey"
-                )
-
+    
     # ------------------------------------------------------------------
     # 5. Log summary
     # ------------------------------------------------------------------
@@ -728,6 +779,51 @@ def _find_source_file(col_name_lower: str, schemas: list, preferred_table: str =
     return "unknown"
 
 
+def _passes_fact_gates(key, relationship_info, schema_map, inbound_refs, median_row_count):
+    """Deterministic checks a fact-table candidate must pass, regardless of
+    whether it was AI-designated or heuristic-scored."""
+    entity = next(
+        (e for e in relationship_info.get("tables", [])
+         if _normalize_name(e.get("table", "")) == key),
+        None
+    )
+    if not entity:
+        return False
+
+    source_schemas = _resolve_source_schemas(entity, schema_map) or (
+        [schema_map[key]] if key in schema_map else []
+    )
+    if not source_schemas:
+        return False
+
+    if inbound_refs[key] >= 2:
+        return False
+
+    outgoing_fk_count = len(entity.get("foreign_keys", []))
+    if outgoing_fk_count < 1:
+        return False
+
+    pk_set = set(_normalize_name(p) for p in entity.get("primary_keys", []))
+    fk_set = set(_normalize_name(f["column"]) for f in entity.get("foreign_keys", []))
+    numeric_types = {"int", "double", "float", "decimal", "bigint", "long"}
+
+    measure_count = sum(
+        1
+        for source_schema in source_schemas
+        for col in source_schema.get("columns", [])
+        if _normalize_name(col["column_name"]) not in pk_set
+        and _normalize_name(col["column_name"]) not in fk_set
+        and any(t in col.get("data_type", "").lower() for t in numeric_types)
+    )
+    if measure_count < 1:
+        return False
+
+    row_count = sum(s.get("row_count", 0) for s in source_schemas)
+    if row_count < median_row_count:
+        return False
+
+    return True
+
 def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: dict) -> dict:
     """
     Deterministic verification layer applied after AI transform, before saving.
@@ -735,12 +831,233 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
     Normalizes for comparison only — never mutates display fields.
     """
     observations = relationship_info.get("observations", [])
+    logging.info("🔖 shared.py VERSION CHECK: patches A-E loaded")
 
     # ── Normalized lookup structures ─────────────────────────────
     schema_map  = {_normalize_name(s["table_name"]): s for s in schemas}
     source_norm = {_normalize_name(k): v for k, v in source_dfs.items()}
 
-    
+    # pk_owner: normalized PK column name -> normalized name of the entity
+    # that "owns" it as a primary key. Built once, up front, from the AI's
+    # raw (pre-validation) declarations so later checks aren't order-
+    # dependent. Used by BLOCK 0 (does a dimension for this ID already
+    # exist?) and BLOCK 1 (cross-entity PK conflict).
+    #
+    # Ownership prefers an entity where the column is a STANDALONE (single-
+    # column) PK — that's the strongest signal of the column being that
+    # table's own identity. A column that only ever appears as one part of
+    # a composite key (e.g. a fact/junction table's [OrderID, CustomerID])
+    # is a foreign-key reference to the real owner, not a competing identity.
+    pk_owner = {}
+    for t in relationship_info.get("tables", []):
+        pks = t.get("primary_keys", [])
+        if len(pks) == 1:
+            pk_owner.setdefault(_normalize_name(pks[0]), _normalize_name(t.get("table", "")))
+    for t in relationship_info.get("tables", []):
+        t_key = _normalize_name(t.get("table", ""))
+        for pk in t.get("primary_keys", []):
+            pk_owner.setdefault(_normalize_name(pk), t_key)
+
+    # ── BLOCK 0: Decomposition Consistency Check ──────────────────
+    # Don't trust the AI's `is_denormalized` flag blindly — verify it against
+    # actual column cardinality. A table that was left as a single entity but
+    # contains 2+ low-cardinality, repeating ID-pattern columns (e.g.
+    # MachineID, LineID, OperatorID each with far fewer distinct values than
+    # rows) IS denormalized and must be decomposed into separate dimension
+    # entities, regardless of what the AI said.
+    raw_analysis = relationship_info.setdefault("raw_entity_analysis", {})
+
+    derived_from_counts = Counter(
+        _normalize_name(t.get("derived_from", ""))
+        for t in relationship_info.get("tables", [])
+        if t.get("derived_from")
+    )
+
+    synthesized_dims = []
+
+    for entity in list(relationship_info.get("tables", [])):
+        display       = entity.get("table", "")
+        key           = _normalize_name(display)
+        derived       = entity.get("derived_from", "")
+        derived_norm  = _normalize_name(derived)
+        source_schema = schema_map.get(derived_norm)
+
+        if not source_schema or not derived_norm:
+            continue
+
+        # Only relevant for tables that were NOT already split into multiple
+        # entities — a properly decomposed source will have count > 1.
+        if derived_from_counts.get(derived_norm, 0) > 1:
+            continue
+
+        row_count = source_schema.get("row_count", 0)
+        if row_count < MIN_ROWS_FOR_DECOMPOSITION_CHECK:
+            continue
+
+        own_pk_norm = {_normalize_name(p) for p in entity.get("primary_keys", [])}
+        own_fk_norm = {_normalize_name(f["column"]) for f in entity.get("foreign_keys", [])}
+
+        # Collect every unlinked ID-pattern column on this table, noting
+        # which ones are also low-cardinality (repeat across rows).
+        id_cols = []  # (cname, cnorm, data_type, is_low_card)
+        for col in source_schema.get("columns", []):
+            cname = col.get("column_name", "")
+            cnorm = _normalize_name(cname)
+            if not _is_id_pattern_column(cname, own_pk_norm):
+                continue
+            if cnorm in own_fk_norm:
+                continue  # already wired up as an FK — not a gap
+            distinct_count = col.get("distinct_count", 0)
+            if distinct_count <= 0:
+                continue
+            is_low_card = (distinct_count / row_count) < ID_CARDINALITY_THRESHOLD
+            id_cols.append((cname, cnorm, col.get("data_type", "string"), is_low_card))
+
+        low_card_cols = [c for c in id_cols if c[3]]
+
+        # AI-driven decomposition trigger
+        raw_entry = raw_analysis.get(derived, {})
+        ai_said_denormalized = raw_entry.get("is_denormalized", False)
+        embedded_concepts = raw_entry.get("embedded_concepts", [])
+
+        ai_flagged_low_card_cols = [
+            c for c in low_card_cols
+            if any(
+                _normalize_name(concept) in c[1]
+                for concept in embedded_concepts
+            )
+        ]
+
+        if (
+            len(low_card_cols) >= MIN_LOW_CARD_ID_COLS_FOR_DECOMPOSITION
+            or (ai_said_denormalized and ai_flagged_low_card_cols)
+        ):
+            raw_entry = raw_analysis.setdefault(derived, {})
+            cols_to_decompose = list({
+                c[1]: c
+                for c in (low_card_cols + ai_flagged_low_card_cols)
+            }.values())
+            if not raw_entry.get("is_denormalized", False):
+                observations.append(
+                    f"OVERRIDE: is_denormalized forced True for '{display.lower()}' — "
+                    f"found {len(low_card_cols)} low-cardinality ID column(s) "
+                    f"({', '.join(c[0] for c in low_card_cols)}) not reflected by AI flag"
+                )
+            raw_entry["is_denormalized"] = True
+
+            # for cname, cnorm, data_type, _ in low_card_cols:
+            for cname, cnorm, data_type, _ in cols_to_decompose:
+                if pk_owner.get(cnorm) is not None:
+                    continue  # a dimension already exists — sub-step B links it
+                base = re.sub(r"id$", "", cname, flags=re.I).strip("_") or cname
+                sibling_cols = [
+                    c for c in source_schema.get("columns", [])
+                    if _normalize_name(c.get("column_name", "")).startswith(_normalize_name(base))
+                    and _normalize_name(c.get("column_name", "")) != cnorm
+                ]
+                dim_table_name = f"{base}_dimension"
+                dim_entity = {
+                    "table":          dim_table_name,
+                    "derived_from":   derived,
+                    "primary_keys":   [cname],
+                    "surrogate_keys": [],
+                    "source_columns": [cname],
+                    "foreign_keys":   [],
+                    "attributes": [
+                        {
+                            "name": cname,
+                            "data_type": data_type,
+                            "is_foreign_key": False,
+                            "is_surrogate": False,
+                            "references": None,
+                            "source": derived,
+                            "display_label": cname,
+                            "tooltip": f"Source column from {derived}"
+                        }
+                    ]
+                }
+                synthesized_dims.append(dim_entity)
+                moved = {
+                    cnorm,
+                    *[
+                        _normalize_name(c["column_name"])
+                        for c in sibling_cols
+                    ]
+                }
+
+                entity["attributes"] = [
+                    a for a in entity.get("attributes", [])
+                    if _normalize_name(a.get("name", "")) not in moved
+                ]
+
+                entity["source_columns"] = [
+                    c for c in entity.get("source_columns", [])
+                    if _normalize_name(c) not in moved
+                ]
+                for sibling in sibling_cols:
+                    dim_entity["attributes"].append({
+                        "name": sibling["column_name"],
+                        "data_type": sibling.get("data_type", "string"),
+                        "is_foreign_key": False,
+                        "is_surrogate": False,
+                        "references": None,
+                        "source": derived,
+                        "display_label": sibling["column_name"],
+                        "tooltip": f"Source column from {derived}"
+                    })
+
+                    dim_entity.setdefault("source_columns", []).append(
+                        sibling["column_name"]
+                    )
+                pk_owner[cnorm] = _normalize_name(dim_table_name)
+                observations.append(
+                    f"CREATED_DIM: {dim_table_name.lower()} | "
+                    f"reason: decomposition consistency — '{cname}' is a low-cardinality "
+                    f"ID column on '{display.lower()}' with no dimension of its own"
+                )
+
+        # ---- Sub-step B: connectivity — link ANY unlinked ID-pattern column
+        # (low-cardinality or not, whether or not sub-step A fired this pass)
+        # to a dimension that already owns it as PK, e.g. one the AI itself
+        # created, or one sub-step A just synthesized above. No "2+" gate
+        # here: even a single unlinked column must not be left dangling if
+        # a matching dimension exists.
+        for cname, cnorm, data_type, _ in id_cols:
+            dim_owner = pk_owner.get(cnorm)
+            if dim_owner is None or dim_owner == key:
+                continue  # no dimension owns this column elsewhere
+            if cnorm in own_fk_norm:
+                continue  # already linked
+
+            entity.setdefault("foreign_keys", []).append({
+                "column":            cname,
+                "references_table":  dim_owner,
+                "references_column": cname
+            })
+            own_fk_norm.add(cnorm)
+
+            already_linked = any(
+                _normalize_name(r.get("from_table", "")) == _normalize_name(display)
+                and _normalize_name(r.get("from_column", "")) == cnorm
+                and _normalize_name(r.get("to_table", "")) == dim_owner
+                for r in relationship_info.get("relationships", [])
+            )
+            if not already_linked:
+                relationship_info.setdefault("relationships", []).append({
+                    "from_table":         _normalize_name(display),
+                    "from_column":        cname,
+                    "to_table":           dim_owner,
+                    "to_column":          cname,
+                    "relationship_type":  "1:M",
+                    "description":        "Auto-linked: matching dimension existed but FK was missing",
+                    "confidence":         1.0
+                })
+            observations.append(
+                f"AUTO_LINKED_FK: {display.lower()}.{cname} → {dim_owner}.{cname} | "
+                f"reason: matching dimension existed but was never wired as a foreign key"
+            )
+
+    relationship_info["tables"].extend(synthesized_dims)
 
     # ── BLOCK 1: PK Validation ───────────────────────────────────
     invalid_pk_targets = set()  # normalized names of tables with no valid PK after validation
@@ -748,6 +1065,7 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
     for entity in relationship_info.get("tables", []):
         display      = entity.get("table", "")
         display_obs = display.lower()
+        
         key          = _normalize_name(display)
         derived_norm = _normalize_name(entity.get("derived_from", ""))
         source_schema = schema_map.get(derived_norm) or schema_map.get(key)
@@ -773,6 +1091,59 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
             surrogate_set = {_normalize_name(s) for s in entity.get("surrogate_keys", [])}
             if pk_norm in surrogate_set:
                 validated_pks.append(pk)
+                continue
+
+            # Check -1: cross-entity PK conflict — if this column name is
+            # already the declared PK of a DIFFERENT entity in the same
+            # model, it's a foreign key here, not this table's own identity,
+            # even if it happens to be unique in both places.
+            owner = pk_owner.get(pk_norm)
+
+            if owner is not None and owner != key:
+
+                is_composite = len(entity.get("primary_keys", [])) > 1
+
+                if not is_composite:
+                    observations.append(
+                        f"REJECTED_PK: {display_obs}.{pk} | reason: '{pk}' is already the "
+                        f"declared primary key of entity '{owner}' — treating as a foreign "
+                        f"key reference here, not this table's own identity"
+                    )
+                    continue
+
+                other_pks = [
+                    p for p in entity.get("primary_keys", [])
+                    if _normalize_name(p) != pk_norm
+                ]
+
+                keep_pk = True
+
+                df = source_norm.get(derived_norm)
+
+                if df is not None:
+                    try:
+                        lookup = {c.lower(): c for c in df.columns}
+
+                        cols = [
+                            lookup[p.lower()]
+                            for p in other_pks
+                            if p.lower() in lookup
+                        ]
+
+                        if len(cols) == len(other_pks) and cols:
+                            other_distinct = len(df[cols].drop_duplicates())
+                            keep_pk = other_distinct < len(df)
+                    except Exception:
+                        keep_pk = True
+
+                if keep_pk:
+                    validated_pks.append(pk)
+                    continue
+
+                observations.append(
+                    f"REJECTED_PK: {display_obs}.{pk} | reason: '{pk}' is already the "
+                    f"declared primary key of entity '{owner}'"
+                )
                 continue
             col     = col_lookup.get(pk_norm)
             if not col:
@@ -961,62 +1332,137 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
             if len(sorted_counts) % 2 == 0
             else sorted_counts[mid]
         )
+    ai_designated_fact = next(
+        (
+            e for e in relationship_info.get("tables", [])
+            if _normalize_name(e.get("table", "")) == "fact_table"
+        ),
+        None,
+    )
 
     best_candidate = None
-    best_score = -1
-    for entity in relationship_info.get("tables", []):
-        display      = entity.get("table", "")
-        display_obs = display.lower()
-        key          = _normalize_name(display)
-        derived_norm = _normalize_name(entity.get("derived_from", ""))
-        source_schema = schema_map.get(derived_norm) or schema_map.get(key)
- 
-        outgoing_fk_count = len(entity.get("foreign_keys", []))
-        source_schema = schema_map.get(derived_norm) or schema_map.get(key)
-        if not source_schema:
-            continue
 
-        row_count = source_schema.get("row_count", 0)
+    if ai_designated_fact:
+        candidate_key = _normalize_name(ai_designated_fact.get("table", ""))
 
-        if not source_schema:
-            continue
-        # Hard exclude: if a table is heavily referenced it's a dimension, not a fact
-        if inbound_refs[key] >= 2:
-            logging.info(f"   FACT GATE FAILED: {display} | inbound_refs={inbound_refs[key]} >= 2")
-            continue
-        # Count numeric non-PK non-FK columns from source schema
-        pk_set = set(_normalize_name(p) for p in entity.get("primary_keys", []))
-        fk_set = set(_normalize_name(f["column"]) for f in entity.get("foreign_keys", []))
-        numeric_types = {"int", "double", "float", "decimal", "bigint", "long"}
+        if _passes_fact_gates(
+            candidate_key,
+            relationship_info,
+            schema_map,
+            inbound_refs,
+            median_row_count,
+        ):
+            best_candidate = candidate_key
+            logging.info(f"   ✅ AI fact designation validated: {best_candidate}")
+        else:
+            logging.warning(
+                f"   ⚠️ AI fact designation '{candidate_key}' failed validation gates — falling back to heuristic scoring"
+            )
 
-        measure_count = sum(
-            1 for col in source_schema.get("columns", [])
-            if _normalize_name(col["column_name"]) not in pk_set
-            and _normalize_name(col["column_name"]) not in fk_set
-            and any(t in col.get("data_type", "").lower() for t in numeric_types)
-        )
+    if best_candidate is None:
+        best_score = -1
 
-        # Deterministic gate
-        if outgoing_fk_count < 1:
-            continue
-        if measure_count < 1:
-            continue
-        if row_count < median_row_count:
-            continue
+        for entity in relationship_info.get("tables", []):
+            display = entity.get("table", "")
+            key = _normalize_name(display)
+            source_schemas = _resolve_source_schemas(entity, schema_map) or (
+                [schema_map[key]] if key in schema_map else []
+            )
+            if not source_schemas:
+                continue
 
-        row_count_weight = row_count / (median_row_count or 1)
-        # ... inside loop, replace the winner block:
-        score = (
-            outgoing_fk_count * 3 +
-            measure_count * 4 +
-            row_count_weight
-        )
+            outgoing_fk_count = len(entity.get("foreign_keys", []))
+            row_count = source_schema.get("row_count", 0)
 
-        if score > best_score:
-            best_score = score
-            best_candidate = key
+            if inbound_refs[key] >= 2:
+                continue
+
+            pk_set = {_normalize_name(p) for p in entity.get("primary_keys", [])}
+            fk_set = {_normalize_name(f["column"]) for f in entity.get("foreign_keys", [])}
+            numeric_types = {"int", "double", "float", "decimal", "bigint", "long"}
+
+            measure_count = sum(
+                1
+                for col in source_schema.get("columns", [])
+                if _normalize_name(col["column_name"]) not in pk_set
+                and _normalize_name(col["column_name"]) not in fk_set
+                and any(t in col.get("data_type", "").lower() for t in numeric_types)
+            )
+
+            if outgoing_fk_count < 1:
+                continue
+            if measure_count < 1:
+                continue
+            if row_count < median_row_count:
+                continue
+
+            row_count_weight = row_count / (median_row_count or 1)
+            score = outgoing_fk_count * 3 + measure_count * 4 + row_count_weight
+
+            if score > best_score:
+                best_score = score
+                best_candidate = key
 
     relationship_info["fact_entity_override"] = best_candidate
+
+    # ── BLOCK 3a: Fact Table Connectivity Safety Net ────────────────
+    # A fact table should end up with FKs pointing to essentially every
+    # dimension it's meaningfully connected to. BLOCK 0 already fixes the
+    # common cause (a dimension that was never created), but if a matching
+    # dimension DOES exist and the AI simply forgot to wire the FK, catch
+    # that gap here too.
+    if best_candidate:
+        fact_entity_for_link = next(
+            (e for e in relationship_info["tables"]
+             if _normalize_name(e.get("table", "")) == best_candidate),
+            None
+        )
+        if fact_entity_for_link:
+            fact_derived_for_link = _normalize_name(fact_entity_for_link.get("derived_from", ""))
+            fact_source_schema = schema_map.get(fact_derived_for_link)
+            fact_pk_norm = {_normalize_name(p) for p in fact_entity_for_link.get("primary_keys", [])}
+            fact_fk_norm = {_normalize_name(f["column"]) for f in fact_entity_for_link.get("foreign_keys", [])}
+
+            if fact_source_schema:
+                for col in fact_source_schema.get("columns", []):
+                    cname = col.get("column_name", "")
+                    cnorm = _normalize_name(cname)
+                    if not _is_id_pattern_column(cname, fact_pk_norm):
+                        continue
+                    if cnorm in fact_fk_norm:
+                        continue  # already linked
+
+                    dim_owner = pk_owner.get(cnorm)
+                    if not dim_owner or dim_owner == best_candidate:
+                        continue  # no matching dimension exists — not this block's job
+
+                    fact_entity_for_link.setdefault("foreign_keys", []).append({
+                        "column":            cname,
+                        "references_table":  dim_owner,
+                        "references_column": cname
+                    })
+                    fact_fk_norm.add(cnorm)
+
+                    already_linked = any(
+                        _normalize_name(r.get("from_table", "")) == best_candidate
+                        and _normalize_name(r.get("from_column", "")) == cnorm
+                        and _normalize_name(r.get("to_table", "")) == dim_owner
+                        for r in relationship_info.get("relationships", [])
+                    )
+                    if not already_linked:
+                        relationship_info.setdefault("relationships", []).append({
+                            "from_table":         best_candidate,
+                            "from_column":        cname,
+                            "to_table":           dim_owner,
+                            "to_column":          cname,
+                            "relationship_type":  "1:M",
+                            "description":        "Auto-linked: matching dimension existed but FK was missing",
+                            "confidence":         1.0
+                        })
+                    observations.append(
+                        f"AUTO_LINKED_FK: {best_candidate}.{cname} → {dim_owner}.{cname} | "
+                        f"reason: matching dimension existed but was never wired as a foreign key"
+                    )
 
     # ── BLOCK 3b: Remove ghost DIM that duplicates the fact grain ────
     if best_candidate:
@@ -1069,22 +1515,66 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
     else:
         logging.info(f"   ✅ Fact entity override: {best_candidate}")
 
+    # ── BLOCK 3c: Standalone Entity Extraction ─────────────────────
+    # Any entity that never appears as from_table/to_table in the final
+    # relationship list — and isn't the fact table itself — gets pulled
+    # out into standalone_entities instead of being left as a fake dim.
+    connected_keys = set()
+    for r in relationship_info.get("relationships", []):
+        connected_keys.add(_normalize_name(r.get("from_table", "")))
+        connected_keys.add(_normalize_name(r.get("to_table", "")))
+
+    standalone_tables = []
+    remaining_tables  = []
+    for entity in relationship_info.get("tables", []):
+        key = _normalize_name(entity.get("table", ""))
+        if key == best_candidate or key in connected_keys:
+            remaining_tables.append(entity)
+        else:
+            standalone_tables.append(entity)
+            observations.append(
+                f"STANDALONE_ENTITY: {entity.get('table', '').lower()} | "
+                f"reason: no relationship to any other entity in the model"
+            )
+
+    relationship_info["tables"] = remaining_tables
+    relationship_info.setdefault("standalone_entities", [])
+    relationship_info["standalone_entities"].extend(
+        e.get("table", "") for e in standalone_tables
+    )
+    # keep full definitions too, not just names, so DDL/output generation
+    # can still render these tables on their own
+    # Any name that was merged into another entity (e.g. fact_table via
+    # Rule 9b) is not actually standalone — it has a relationship, it's
+    # just not expressed as a from/to pair. Strip it out.
+    merged_source_names = set()
+    for entity in relationship_info.get("tables", []):
+        merged_source_names.update(_derived_from_list(entity))
+
+    relationship_info["standalone_entities"] = [
+        name for name in relationship_info.get("standalone_entities", [])
+        if _normalize_name(name) not in merged_source_names
+    ]
+    relationship_info["standalone_entity_definitions"] = [
+        e for e in relationship_info.get("standalone_entity_definitions", [])
+        if _normalize_name(e.get("table", "")) not in merged_source_names
+    ]
+   
+
     # ── BLOCK 4: Entity Name Guard ────────────────────────────────
     valid_tables = []
     for entity in relationship_info.get("tables", []):
         display      = entity.get("table", "")
         display_obs  = display.lower()
+        key          = _normalize_name(display)
         derived_norm = _normalize_name(entity.get("derived_from", ""))
         logging.info(f"   BLOCK4 CHECK: {display_obs} | derived_norm={derived_norm} | in schema_map={derived_norm in schema_map} | schema_map_keys={list(schema_map.keys())}")
 
 
-        if derived_norm:
-            exact_match = derived_norm in schema_map
-            fuzzy_match = any(
-                derived_norm in k or k in derived_norm
-                for k in schema_map
-            )
-            if not exact_match and not fuzzy_match:
+        derived_parts = _derived_from_list(entity)
+        if derived_parts:
+            matched = [d for d in derived_parts if d in schema_map]
+            if not matched:
                 observations.append(
                     f"REJECTED_ENTITY: {display_obs} | "
                     f"derived_from '{entity.get('derived_from')}' not traceable to any source schema"
@@ -1094,12 +1584,35 @@ def verify_and_clean_model(relationship_info: dict, schemas: list, source_dfs: d
         valid_tables.append(entity)   # original object
 
     relationship_info["tables"]       = valid_tables
+    # ── PATCH E: Orphan Relationship Cleanup ───────────────────────
+    surviving_keys = {_normalize_name(e.get("table", "")) for e in valid_tables}
+    kept_relationships = []
+    logging.info(f"🧹 PATCH_E_ACTIVE | relationships_checked={len(relationship_info.get('relationships', []))} | dropped={len(relationship_info.get('relationships', [])) - len(kept_relationships)}")
+    for r in relationship_info.get("relationships", []):
+        from_key = _normalize_name(r.get("from_table", ""))
+        to_key   = _normalize_name(r.get("to_table", ""))
+        if from_key in surviving_keys and to_key in surviving_keys:
+            kept_relationships.append(r)
+        else:
+            observations.append(
+                f"REJECTED_RELATIONSHIP: {r.get('from_table','')}→{r.get('to_table','')} "
+                f"| reason: references entity dropped in BLOCK 4"
+            )
+    relationship_info["relationships"] = kept_relationships
     relationship_info["observations"] = observations
     return relationship_info
 
 # ====================================================================
 # RULE-BASED FALLBACK
 # ====================================================================
+
+def _camel_to_snake(name: str) -> str:
+    """MachineID -> machine_id, ProductionID -> production_id"""
+    s1 = re.sub(r'(.)([A-Z][a-z]+)', r'\1_\2', name)
+    s2 = re.sub(r'([a-z0-9])([A-Z])', r'\1_\2', s1)
+    return s2.lower()
+
+    
 def _fallback_relationship_detection(schemas):
     """
     Rule-based fallback when AI fails or returns invalid JSON.
@@ -1141,18 +1654,19 @@ def _fallback_relationship_detection(schemas):
     pk_map = {}
     for table_name, columns in table_columns.items():
         for col in columns:
-            col_name       = col.get("column_name", "").lower().strip()
-            is_potential   = col.get("is_potential_key", False)
-            null_pct       = col.get("null_percentage", 100.0)
+            raw_name     = col.get("column_name", "").strip()
+            col_name     = raw_name.lower()
+            col_snake    = _camel_to_snake(raw_name)
+            is_potential = col.get("is_potential_key", False)
+            null_pct     = col.get("null_percentage", 100.0)
 
-            # Hard null guard — never accept high-null column as PK
             if null_pct > NULL_THRESHOLD_FOR_KEY:
                 continue
 
             if is_potential:
-                if col_name.endswith("_id"):
-                    base = col_name.replace("_id", "")
-                    if base == table_name or base + "s" == table_name or base == table_name + "s":
+                if col_snake.endswith("_id"):
+                    base = col_snake[:-3]
+                    if base == table_name or base in table_name or table_name in base:
                         pk_map[table_name] = col_name
                         logging.info(f"✓ PK (fallback): {table_name}.{col_name}")
                         break
@@ -1169,16 +1683,18 @@ def _fallback_relationship_detection(schemas):
         foreign_keys = []
 
         for col in columns:
-            col_name = col.get("column_name", "").lower().strip()
-            null_pct = col.get("null_percentage", 100.0)
+            raw_name  = col.get("column_name", "").strip()
+            col_name  = raw_name.lower()
+            col_snake = _camel_to_snake(raw_name)
+            null_pct  = col.get("null_percentage", 100.0)
 
             if col_name == pk_map.get(table_name):
                 continue
             if null_pct > NULL_THRESHOLD_FOR_KEY:
                 continue
 
-            if col_name.endswith("_id"):
-                referenced_table = _find_matching_table(col_name, all_table_names)
+            if col_snake.endswith("_id"):
+                referenced_table = _find_matching_table(col_snake, all_table_names)
                 if referenced_table and referenced_table != table_name:
                     referenced_pk = pk_map.get(referenced_table)
                     if referenced_pk:
@@ -1194,13 +1710,9 @@ def _fallback_relationship_detection(schemas):
                             "to_column":         referenced_pk,
                             "relationship_type": "M:1",
                             "description":       f"Many {table_name} to One {referenced_table}",
-                            "confidence":        None  # rule-based, no confidence score
+                            "confidence":        None
                         })
-                        logging.info(
-                            f"🔗 Fallback relationship: "
-                            f"{table_name}.{col_name} → {referenced_table}.{referenced_pk}"
-                        )
-
+                        logging.info(f"🔗 Fallback relationship: {table_name}.{col_name} → {referenced_table}.{referenced_pk}")
         original_name = original_to_normalized.get(table_name, table_name)
 
         # In fallback all columns are treated as source columns (no normalization)
@@ -1274,11 +1786,11 @@ def _normalize_table_name(table_name):
 
 
 def _find_matching_table(column_name, table_names):
-    """Find best matching table for a foreign key column."""
+    """Find best matching table for a foreign key column. column_name must already be snake_case (e.g. 'machine_id')."""
     if not column_name.endswith("_id"):
         return None
 
-    base_name = column_name.replace("_id", "")
+    base_name = column_name[:-3]
 
     if base_name in table_names:
         return base_name
@@ -1297,7 +1809,6 @@ def _find_matching_table(column_name, table_names):
             return table
 
     return None
-
 
 # ====================================================================
 # JSON EXTRACTION (Robust AI Cleanup)
@@ -1328,6 +1839,25 @@ def _extract_json_from_text(text):
 
     candidate = text[start:end+1]
 
+    # Repair pattern: AI sometimes emits invalid JS/Python-style string
+    # concatenation, e.g.  "foo"\n+ "bar"  instead of a single string.
+    # Collapse adjacent quoted strings joined by '+' into one string.
+    repaired = re.sub(
+        r'"\s*\n?\s*\+\s*\n?\s*"',
+        '',
+        candidate,
+    )
+    if repaired != candidate:
+        try:
+            result = json.loads(repaired)
+            logging.warning(
+                "⚠️ AI JSON had string-concatenation syntax ('+' between "
+                "quoted strings) — repaired automatically before parsing."
+            )
+            return result
+        except json.JSONDecodeError:
+            pass  # repair didn't fix it — fall through to normal error path
+
     try:
         return json.loads(candidate)
     except json.JSONDecodeError as json_err:
@@ -1338,7 +1868,6 @@ def _extract_json_from_text(text):
         raise ValueError(
             f"AI JSON malformed and unrecoverable: {json_err}"
         ) from json_err
-
 
 # ====================================================================
 # DATATYPE HELPERS
@@ -1710,7 +2239,7 @@ def analyze_schemas_with_ai(schemas):
                         {"role": "user", "content": prompt}
                     ],
                     temperature=0,
-                    max_tokens=5000
+                    max_tokens=_estimate_max_tokens(schemas)
                 )
                 content = response.choices[0].message.content.strip()
                 return _extract_json_from_text(content)
