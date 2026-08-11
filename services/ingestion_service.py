@@ -39,6 +39,37 @@ class IngestionService:
         return blob_path
 
     # =========================================================
+    # RESOLVE ACTUAL S3 KEY (CASE-INSENSITIVE SAFETY NET)
+    # =========================================================
+    def resolve_actual_key(self, bucket, file_name):
+        """
+        S3 keys are case-sensitive, but upstream callers (e.g. prompt
+        parsing) may pass a different case than what's actually stored.
+        This looks up the bucket contents and matches case-insensitively
+        so a mismatch like 'calendar.csv' vs 'Calendar.csv' doesn't fail.
+
+        Falls back to the original file_name if no case-insensitive match
+        is found, so the resulting error still clearly reports NoSuchKey.
+        """
+        try:
+            resp = self.s3.list_objects_v2(Bucket=bucket)
+        except Exception as list_err:
+            # Surface *why* listing failed instead of hiding it — this is
+            # commonly a region mismatch or missing s3:ListBucket permission.
+            print(f"⚠️ resolve_actual_key: list_objects_v2 failed for bucket='{bucket}': {list_err}")
+            return file_name
+
+        keys = [obj["Key"] for obj in resp.get("Contents", [])]
+        print(f"🔎 resolve_actual_key: bucket='{bucket}' contains {len(keys)} object(s): {keys}")
+
+        for key in keys:
+            if key.lower() == file_name.lower():
+                return key
+
+        print(f"⚠️ resolve_actual_key: no case-insensitive match for '{file_name}' in bucket='{bucket}'")
+        return file_name
+
+    # =========================================================
     # S3 INGESTION
     # =========================================================
     def ingest_from_s3(self, bucket, file_name, user_id, job_id):
@@ -52,13 +83,20 @@ class IngestionService:
             if not file_name:
                 raise Exception("❌ file_name is required for S3 source")
 
-            # Normalize filename
-            clean_name = self.normalize_filename(file_name)
+            # Resolve the real, case-correct key before attempting the fetch
+            actual_key = self.resolve_actual_key(bucket, file_name)
+
+            if actual_key != file_name:
+                print(f"🔧 Case mismatch corrected: '{file_name}' → '{actual_key}'")
+
+            # Normalize filename (used for the destination blob name only —
+            # the S3 lookup itself uses actual_key, the real, case-correct key)
+            clean_name = self.normalize_filename(actual_key)
 
             # Fetch from S3
             obj = self.s3.get_object(
                 Bucket=bucket,
-                Key=file_name
+                Key=actual_key
             )
 
             data = obj["Body"].read()
@@ -67,7 +105,11 @@ class IngestionService:
             return self.upload_to_blob(data, clean_name, user_id, job_id)
 
         except Exception as e:
-            raise Exception(f"S3 ingestion failed: {str(e)}")
+            # Include bucket + key so failures are traceable when ingesting
+            # multiple files in a single request.
+            raise Exception(
+                f"S3 ingestion failed for bucket='{bucket}' key='{file_name}': {str(e)}"
+            )
 
     # =========================================================
     # AZURE INGESTION (DYNAMIC CONTAINER)
@@ -100,7 +142,9 @@ class IngestionService:
             return self.upload_to_blob(data, clean_name, user_id, job_id)
 
         except Exception as e:
-            raise Exception(f"Azure ingestion failed: {str(e)}")
+            raise Exception(
+                f"Azure ingestion failed for container='{container_name}' key='{file_name}': {str(e)}"
+            )
 
     # =========================================================
     # MAIN INGESTION ENTRY
@@ -163,3 +207,21 @@ class IngestionService:
         print(f"✅ Uploaded files: {uploaded_paths}")
 
         return uploaded_paths
+
+    # =========================================================
+    # DEBUG HELPER — list what actually exists in an S3 bucket
+    # =========================================================
+    def debug_list_s3_keys(self, bucket, prefix=""):
+        """
+        Quick diagnostic: prints every key in `bucket` (optionally filtered
+        by `prefix`) so you can compare exact casing/paths against what
+        your ingestion request is asking for.
+        """
+        resp = self.s3.list_objects_v2(Bucket=bucket, Prefix=prefix)
+        keys = [obj["Key"] for obj in resp.get("Contents", [])]
+
+        print(f"🔎 Found {len(keys)} object(s) in '{bucket}' (prefix='{prefix}'):")
+        for k in keys:
+            print(f"   - {repr(k)}")
+
+        return keys
