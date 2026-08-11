@@ -1,7 +1,24 @@
 import boto3
 import os
+import re
+import io
+import pandas as pd
+from hdbcli import dbapi
 from azure.storage.blob import BlobServiceClient
-from config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER
+from config import (
+    BLOB_CONN_STR,
+    DATA_INGESTION_CONTAINER,
+    HANA_HOST,
+    HANA_PORT,
+    HANA_USER,
+    HANA_PASSWORD,
+)
+
+# Only allow safe SQL identifier characters (letters, digits, underscore).
+# SAP HANA doesn't support parameterizing identifiers (schema/table names)
+# the way it does values, so we validate manually before ever putting
+# user-supplied schema/table strings into a query.
+_IDENTIFIER_RE = re.compile(r'^[A-Za-z0-9_]+$')
 
 
 class IngestionService:
@@ -147,6 +164,120 @@ class IngestionService:
             )
 
     # =========================================================
+    # SAP HANA — CONNECTION HELPER
+    # =========================================================
+    def _get_hana_connection(self):
+        return dbapi.connect(
+            address=HANA_HOST,
+            port=HANA_PORT,
+            user=HANA_USER,
+            password=HANA_PASSWORD,
+        )
+
+    # =========================================================
+    # SAP HANA — VALIDATE IDENTIFIER (PREVENT SQL INJECTION)
+    # =========================================================
+    def _validate_identifier(self, name, label):
+        if not name or not _IDENTIFIER_RE.match(name):
+            raise Exception(
+                f"❌ Invalid {label}: '{name}' "
+                f"(only letters, digits, and underscore are allowed)"
+            )
+
+    # =========================================================
+    # SAP HANA INGESTION
+    # =========================================================
+    def ingest_from_sap_hana(self, schema, table, user_id, job_id):
+
+        try:
+            print(f"📥 Fetching from SAP HANA → {schema}.{table}")
+
+            if not schema:
+                raise Exception("❌ schema is required for SAP HANA source")
+
+            if not table:
+                raise Exception("❌ table is required for SAP HANA source")
+
+            # Reject anything that isn't a plain identifier before it
+            # ever touches a SQL string.
+            self._validate_identifier(schema, "schema")
+            self._validate_identifier(table, "table")
+
+            schema_upper = schema.upper()
+            table_upper = table.upper()
+
+            conn = self._get_hana_connection()
+
+            try:
+                cursor = conn.cursor()
+
+                # ---- resolve actual, case-preserved schema name ----
+                # HANA auto-uppercases unquoted identifiers, but a table
+                # or schema created with a quoted identifier (e.g.
+                # CREATE TABLE "Employees" (...)) keeps its exact case.
+                # Compare case-insensitively, then use the *real* stored
+                # name (whatever case it actually is) going forward.
+                cursor.execute(
+                    "SELECT SCHEMA_NAME FROM SYS.SCHEMAS "
+                    "WHERE UPPER(SCHEMA_NAME) = UPPER(?)",
+                    (schema,)
+                )
+                schema_row = cursor.fetchone()
+                if not schema_row:
+                    raise Exception(f"❌ Schema not found: {schema}")
+
+                actual_schema = schema_row[0]
+
+                # ---- resolve actual, case-preserved table name ----
+                cursor.execute(
+                    "SELECT TABLE_NAME FROM SYS.TABLES "
+                    "WHERE SCHEMA_NAME = ? AND UPPER(TABLE_NAME) = UPPER(?)",
+                    (actual_schema, table)
+                )
+                table_row = cursor.fetchone()
+                if not table_row:
+                    raise Exception(
+                        f"❌ Table not found: {schema}.{table}"
+                    )
+
+                actual_table = table_row[0]
+
+                if actual_schema != schema or actual_table != table:
+                    print(
+                        f"🔧 Case mismatch corrected: "
+                        f"'{schema}.{table}' → '{actual_schema}.{actual_table}'"
+                    )
+
+                # Values came straight from the catalog (not user input),
+                # and _validate_identifier already rejected anything with
+                # quote/injection characters in the original input — safe
+                # to interpolate as quoted identifiers.
+                query = f'SELECT * FROM "{actual_schema}"."{actual_table}"'
+                print(f"🔎 Running query: {query}")
+
+                df = pd.read_sql(query, conn)
+
+            finally:
+                conn.close()
+
+            print(f"✅ Retrieved {len(df)} row(s) from {actual_schema}.{actual_table}")
+
+            # Convert to CSV bytes, same as every other source type, so
+            # downstream (blob upload, datamodel, ETL) is unchanged.
+            csv_buffer = io.StringIO()
+            df.to_csv(csv_buffer, index=False)
+            data = csv_buffer.getvalue().encode("utf-8")
+
+            clean_name = self.normalize_filename(f"{actual_table}.csv")
+
+            return self.upload_to_blob(data, clean_name, user_id, job_id)
+
+        except Exception as e:
+            raise Exception(
+                f"SAP HANA ingestion failed for schema='{schema}' table='{table}': {str(e)}"
+            )
+
+    # =========================================================
     # MAIN INGESTION ENTRY
     # =========================================================
     def ingest_sources(self, sources, user_id, job_id):
@@ -179,6 +310,19 @@ class IngestionService:
                 path = self.ingest_from_azure(
                     container_name=container_name,
                     file_name=file_name,
+                    user_id=user_id,
+                    job_id=job_id
+                )
+
+            # ---------------- SAP HANA ----------------
+            elif src_type == "sap_hana":
+
+                schema = src.get("schema")
+                table = src.get("table")
+
+                path = self.ingest_from_sap_hana(
+                    schema=schema,
+                    table=table,
                     user_id=user_id,
                     job_id=job_id
                 )
@@ -225,3 +369,46 @@ class IngestionService:
             print(f"   - {repr(k)}")
 
         return keys
+
+    # =========================================================
+    # DEBUG HELPER — list what actually exists in a HANA schema
+    # =========================================================
+    def debug_list_hana_tables(self, schema):
+        """
+        Quick diagnostic: prints every table in `schema` so you can
+        confirm the exact schema/table names (and their real casing)
+        before ingesting.
+        """
+        self._validate_identifier(schema, "schema")
+
+        conn = self._get_hana_connection()
+
+        try:
+            cursor = conn.cursor()
+
+            # Resolve actual case-preserved schema name first
+            cursor.execute(
+                "SELECT SCHEMA_NAME FROM SYS.SCHEMAS WHERE UPPER(SCHEMA_NAME) = UPPER(?)",
+                (schema,)
+            )
+            schema_row = cursor.fetchone()
+            if not schema_row:
+                print(f"⚠️ Schema not found: {schema}")
+                return []
+
+            actual_schema = schema_row[0]
+
+            cursor.execute(
+                "SELECT TABLE_NAME FROM SYS.TABLES "
+                "WHERE SCHEMA_NAME = ? ORDER BY TABLE_NAME",
+                (actual_schema,)
+            )
+            tables = [row[0] for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+        print(f"🔎 Found {len(tables)} table(s) in schema '{actual_schema}':")
+        for t in tables:
+            print(f"   - {repr(t)}")
+
+        return tables
