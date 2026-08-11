@@ -281,6 +281,8 @@ def get_user_jobs(user_id: str):
             })
     return jobs
 
+import math
+
 def convert_numpy(obj):
 
     if isinstance(obj, dict):
@@ -296,23 +298,44 @@ def convert_numpy(obj):
         return int(obj)
 
     elif isinstance(obj, np.floating):
-        return float(obj)
+        val = float(obj)
+        return None if (math.isnan(val) or math.isinf(val)) else val
 
     elif isinstance(obj, np.bool_):
         return bool(obj)
 
     elif isinstance(obj, np.ndarray):
-        return obj.tolist()
+        return convert_numpy(obj.tolist())
 
     elif isinstance(obj, pd.DataFrame):
-        return obj.to_dict(orient="records")
+        return convert_numpy(obj.to_dict(orient="records"))
 
     elif isinstance(obj, pd.Series):
-        return obj.tolist()
+        return convert_numpy(obj.tolist())
 
     elif isinstance(obj, pd.Timestamp):
         return obj.isoformat()
 
+    elif obj is pd.NaT:
+        return None
+
+    # Catch plain Python floats too — this is what NaN/Infinity look like
+    # AFTER pandas .to_dict()/.tolist() calls, which don't go through the
+    # np.floating branch above.
+    elif isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
+
+    return obj
+
+
+
+def sanitize_for_json(obj):
+    if isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [sanitize_for_json(v) for v in obj]
+    if isinstance(obj, float):
+        return None if (math.isnan(obj) or math.isinf(obj)) else obj
     return obj
 
 
@@ -369,44 +392,6 @@ import numpy as np
 import pandas as pd
 import uuid
 
-
-# ==========================================
-# SAFE NUMPY/PANDAS CONVERTER
-# ==========================================
-
-def convert_numpy(obj):
-
-    if isinstance(obj, dict):
-        return {str(k): convert_numpy(v) for k, v in obj.items()}
-
-    elif isinstance(obj, list):
-        return [convert_numpy(i) for i in obj]
-
-    elif isinstance(obj, tuple):
-        return [convert_numpy(i) for i in obj]
-
-    elif isinstance(obj, np.integer):
-        return int(obj)
-
-    elif isinstance(obj, np.floating):
-        return float(obj)
-
-    elif isinstance(obj, np.bool_):
-        return bool(obj)
-
-    elif isinstance(obj, np.ndarray):
-        return obj.tolist()
-
-    elif isinstance(obj, pd.DataFrame):
-        return obj.to_dict(orient="records")
-
-    elif isinstance(obj, pd.Series):
-        return obj.tolist()
-
-    elif isinstance(obj, pd.Timestamp):
-        return obj.isoformat()
-
-    return obj
 
 
 # ==========================================
@@ -785,6 +770,8 @@ def run(req: RunRequest):
         safe_response = convert_numpy(
             response_data
         )
+
+        safe_response = sanitize_for_json(safe_response)
 
         return jsonable_encoder(
             safe_response
