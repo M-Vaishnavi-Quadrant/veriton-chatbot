@@ -1,4 +1,5 @@
 import json
+import math
 import uuid
 
 from datetime import datetime
@@ -8,6 +9,32 @@ from azure.storage.blob import BlobServiceClient
 from config import BLOB_CONN_STR
 
 THREAD_CONTAINER = "threads"
+
+
+def _sanitize(obj):
+    """
+    Recursively replace NaN/Infinity floats with None.
+
+    json.dumps() defaults to allow_nan=True, so NaN/Infinity values
+    (e.g. from a pandas merge with unmatched rows) get silently written
+    into thread blobs as literal `NaN` — invalid per the JSON spec, but
+    Python tolerates writing/reading it. Starlette's JSONResponse does
+    NOT tolerate it (allow_nan=False), so anything that slips through
+    here blows up later when a thread is returned from an endpoint,
+    even though the failure has nothing to do with that endpoint itself.
+    """
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+
+    if isinstance(obj, list):
+        return [_sanitize(v) for v in obj]
+
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+
+    return obj
 
 
 class ThreadService:
@@ -56,7 +83,11 @@ class ThreadService:
 
         job_id,
 
-        title="New Chat"
+        title="New Chat",
+
+        session_id=None,
+
+        agent_id=None
     ):
 
         now = datetime.utcnow().isoformat()
@@ -107,7 +138,14 @@ class ThreadService:
 
                 "job_saved": False,
 
-                "conversation_state": None
+                "conversation_state": None,
+
+                # External veriton.ai session, created via create_session
+                # at thread-creation time. May be None if that call
+                # failed — see create_thread endpoint for handling.
+                "session_id": session_id,
+
+                "agent_id": agent_id
             }
         }
 
@@ -143,6 +181,11 @@ class ThreadService:
             datetime.utcnow().isoformat()
         )
 
+        # Sanitize before writing so NaN/Infinity (e.g. from an ETL
+        # response stored via add_action) never gets persisted in the
+        # first place.
+        clean_thread = _sanitize(thread)
+
         blob = self.container.get_blob_client(
 
             self._path(
@@ -153,7 +196,7 @@ class ThreadService:
         blob.upload_blob(
 
             json.dumps(
-                thread,
+                clean_thread,
                 indent=2
             ),
 
@@ -178,10 +221,15 @@ class ThreadService:
 
             return None
 
-        return json.loads(
+        data = json.loads(
 
             blob.download_blob().readall()
         )
+
+        # Safety net for threads saved BEFORE this fix — those blobs may
+        # already contain literal NaN values on disk. Sanitizing on read
+        # repairs them transparently without needing a data migration.
+        return _sanitize(data)
 
     # =====================================================
     # LIST THREADS
