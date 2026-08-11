@@ -9,7 +9,7 @@ import uuid
 from datetime import datetime
 from io import BytesIO
 from typing import Any, Dict, List, Optional
-
+import requests
 import numpy as np
 import pandas as pd
 import requests
@@ -52,6 +52,7 @@ from services.scheduler_service import schedule_pipeline
 from services.thread_service import ThreadService
 from services.upload_service import UploadService
 
+CREATE_SESSION_URL = "https://api.veriton.ai/api/service3/create_session"
 
 # =========================
 # CLIENTS & SERVICES
@@ -152,6 +153,7 @@ class GenerateDQRequest(BaseModel):
 class CreateThreadRequest(BaseModel):
     user_id: str
     job_id: str
+    user_email: str
     title: str = "New Chat"
 
 
@@ -2824,9 +2826,49 @@ def run_automl(req: AutoMLRequest):
 
 @app.post("/create-thread")
 def create_thread(req: CreateThreadRequest):
+ 
+    session_id = None
+    agent_id = None
+ 
+    # ==========================================
+    # CREATE EXTERNAL SESSION (VERITON.AI)
+    # ==========================================
+    try:
+        print(f"📡 Creating session for {req.user_email}")
+ 
+        resp = requests.post(
+            CREATE_SESSION_URL,
+            headers={"accept": "application/json"},
+            data={"user_email": req.user_email},
+            timeout=10
+        )
+ 
+        resp.raise_for_status()
+ 
+        session_data = resp.json()
+ 
+        session_id = session_data.get("session_id")
+        agent_id = session_data.get("agent_id")
+ 
+        print(f"✅ Session created: {session_id} (agent: {agent_id})")
+ 
+    except Exception as e:
+        # Non-fatal: don't block thread creation if the session service
+        # is temporarily unavailable. session_id/agent_id will be None
+        # on the thread and can be retried/backfilled later if needed.
+        print(f"⚠️ create_session failed: {e}")
+ 
+    # ==========================================
+    # CREATE THREAD (WITH SESSION INFO ATTACHED)
+    # ==========================================
     return thread_service.create_thread(
-        user_id=req.user_id, job_id=req.job_id, title=req.title
+        user_id=req.user_id,
+        job_id=req.job_id,
+        title=req.title,
+        session_id=session_id,
+        agent_id=agent_id,
     )
+ 
 
 
 @app.get("/thread/{thread_id}")
