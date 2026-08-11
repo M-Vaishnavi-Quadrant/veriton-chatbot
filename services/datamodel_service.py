@@ -1,4 +1,5 @@
 import io
+import re
 import pandas as pd
 from azure.storage.blob import BlobServiceClient
 from config import BLOB_CONN_STR, DATA_INGESTION_CONTAINER
@@ -13,7 +14,32 @@ class DataModelService:
         print(f"[MODEL] {msg}")
 
     def normalize(self, col):
-        return col.lower().replace(" ", "_")
+        """
+        Normalize a column name to snake_case so FK/PK naming comparisons
+        work regardless of source casing convention.
+
+        Handles:
+          - camelCase / PascalCase -> snake_case  (DateID -> date_id)
+          - existing snake_case / spaces -> unchanged apart from lowering
+          - already-underscored mixed case (supplier_ZipCode -> supplier_zip_code)
+
+        Previously this only lowercased + replaced spaces, so "DateID"
+        became "dateid" (no underscore before "id"), which silently broke
+        every col.endswith("_id") check in detect_relationships() and
+        caused relationship/fact-table detection to fail with zero matches.
+        """
+        col = str(col).strip()
+
+        # Insert underscore between a lowercase/digit and a following uppercase
+        # e.g. "DateID" -> "Date_ID", "PlantID" -> "Plant_ID"
+        col = re.sub(r'(?<=[a-z0-9])(?=[A-Z])', '_', col)
+
+        col = col.lower().replace(" ", "_")
+
+        # Collapse any accidental double underscores from the substitution
+        col = re.sub(r'_+', '_', col)
+
+        return col
 
     # =========================
     # LOAD TABLES
@@ -118,7 +144,15 @@ class DataModelService:
             if f == t:
                 continue
 
-            key = tuple(sorted([f, t]))
+            # Dedup on table pair + column pair, not just table pair.
+            # Two tables can legitimately share more than one valid FK
+            # link (e.g. productionorders/employees share both EmployeeID
+            # and PlantID) — deduping on table pair alone silently drops
+            # all but one, arbitrarily, based on column iteration order.
+            key = tuple(sorted([
+                f"{f}.{rel['from_column']}",
+                f"{t}.{rel['to_column']}"
+            ]))
 
             if key in seen:
                 continue
